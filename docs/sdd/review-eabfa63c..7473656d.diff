@@ -1,0 +1,1003 @@
+# Review package: eabfa63c..7473656d
+
+## Commits
+7473656d feat(nbd): TRIM and WRITE_ZEROES via PunchHole
+
+## Files changed
+ internal/adapter/nbd/connection.go       |  49 ++++-
+ internal/adapter/nbd/connection_test.go  | 360 ++++++++++++++++++++++++++++++-
+ internal/adapter/nbd/handlers_write.go   | 147 +++++++++++++
+ internal/adapter/nbd/integration_test.go | 136 ++++++++++++
+ pkg/adapter/nbd/config.go                |  11 +-
+ 5 files changed, 687 insertions(+), 16 deletions(-)
+
+## Diff
+diff --git a/internal/adapter/nbd/connection.go b/internal/adapter/nbd/connection.go
+index 8a32ad71..fc759f1b 100644
+--- a/internal/adapter/nbd/connection.go
++++ b/internal/adapter/nbd/connection.go
+@@ -12,24 +12,27 @@ import (
+ 	"github.com/marmos91/dittofs/internal/adapter/common"
+ 	"github.com/marmos91/dittofs/internal/logger"
+ 	"github.com/marmos91/dittofs/pkg/block"
+ 	"github.com/marmos91/dittofs/pkg/block/engine"
+ 	"github.com/marmos91/dittofs/pkg/metadata"
+ 	merrs "github.com/marmos91/dittofs/pkg/metadata/errors"
+ )
+ 
+ // Timeouts bounds the three waits one NBD connection has.
+ //
+-// Read bounds reading one request header or payload. Idle bounds a connection
+-// that has completed its handshake but sends nothing, so Read must be the
+-// shorter of the two or a stalled client is held open by the wrong timer. Write
+-// bounds writing one reply. The zero value of any field means no bound.
++// Idle bounds the wait for the next request header: a connection that has
++// completed its handshake and sends nothing, or stops part-way through a header,
++// is held only that long. Read bounds finishing a request that has already
++// started — the payload read in handleWrite — so it is armed afresh once a
++// header has been parsed. Write bounds writing one reply. The zero value of any
++// field means no bound, which is why Idle cannot be folded into Read: zero is a
++// sentinel for "no idle timeout", not a duration.
+ type Timeouts struct {
+ 	Read  time.Duration
+ 	Write time.Duration
+ 	Idle  time.Duration
+ }
+ 
+ // BlockStore is the engine surface the wire handlers use.
+ //
+ // An interface rather than *engine.Store so the dispatch tests can drive
+ // failure modes the engine cannot be made to produce on demand. The durability
+@@ -193,21 +196,38 @@ func (h *Handler) serve(ctx context.Context, conn net.Conn) error {
+ 
+ 	for {
+ 		// The read deadline is armed before the read, and deliberately not
+ 		// while draining. initiateShutdown sets a 100 ms deadline on every
+ 		// active connection to unblock pending reads (pkg/adapter/base.go:447),
+ 		// and a fresh SetReadDeadline replaces it — so arming the full request
+ 		// budget here would hold the drain open for that whole budget. Leaving
+ 		// the short deadline in place is what lets an idle connection close
+ 		// inside the drain window.
+ 		if !h.draining() {
+-			if err := conn.SetReadDeadline(time.Now().Add(h.timeouts.Read)); err != nil {
++			// Idle bounds the wait for a header; Read bounds finishing a request
++			// that has already started (the payload read in handleWrite). At the
++			// defaults both are 5m, so the distinction only shows for an operator
++			// who separates them — which is exactly when the field's own doc has
++			// to be true rather than nearly true.
++			//
++			// decision: the two are separate arms rather than a min(). Idle == 0
++			// means "no idle timeout", so a min() would turn an unset Idle into an
++			// immediate timeout; the guard has to be independent, which is the
++			// shape NFS uses at pkg/adapter/nfs/connection.go:312. A consequence is
++			// that an operator who sets Idle > Read gets an idle wait longer than
++			// the read budget, and that is the intended reading: Read is a budget
++			// for finishing work, not a ceiling on waiting for a client.
++			budget := h.timeouts.Read
++			if h.timeouts.Idle > 0 {
++				budget = h.timeouts.Idle
++			}
++			if err := conn.SetReadDeadline(time.Now().Add(budget)); err != nil {
+ 				return err
+ 			}
+ 		}
+ 
+ 		req, err := ReadRequest(conn)
+ 		if err != nil {
+ 			return err
+ 		}
+ 
+ 		// DISC is handled before the draining check because it has no reply in
+@@ -246,26 +266,35 @@ func (h *Handler) serve(ctx context.Context, conn net.Conn) error {
+ 		case CmdWrite:
+ 			if err := h.handleWrite(ctx, bs, exp, req, conn); err != nil {
+ 				return err
+ 			}
+ 
+ 		case CmdFlush:
+ 			if err := h.handleFlush(ctx, bs, exp, req, conn); err != nil {
+ 				return err
+ 			}
+ 
++		case CmdTrim:
++			if err := h.handleTrim(ctx, bs, exp, req, conn); err != nil {
++				return err
++			}
++
++		case CmdWriteZeroes:
++			if err := h.handleWriteZeroes(ctx, bs, exp, req, conn); err != nil {
++				return err
++			}
++
+ 		default:
+-			// Every command the adapter advertises but does not yet serve
+-			// (TRIM, WRITE_ZEROES, CACHE, BLOCK_STATUS) and every value the spec
+-			// does not define. An unimplemented command is an invalid command:
+-			// NBD_ENOTSUP is reserved by the spec for WRITE_ZEROES with
+-			// FAST_ZERO, which the adapter does not advertise.
++			// Every command the adapter does not serve (CACHE, BLOCK_STATUS) and
++			// every value the spec does not define. An unimplemented command is an
++			// invalid command: NBD_ENOTSUP is reserved by the spec for WRITE_ZEROES
++			// with FAST_ZERO, which the adapter does not advertise.
+ 			if err := h.writeReply(conn, req.Cookie, ErrEINVAL, nil); err != nil {
+ 				return err
+ 			}
+ 		}
+ 	}
+ }
+ 
+ // writeReply writes one simple reply header, followed by the payload when there
+ // is one.
+ //
+diff --git a/internal/adapter/nbd/connection_test.go b/internal/adapter/nbd/connection_test.go
+index 15052fb0..5203980c 100644
+--- a/internal/adapter/nbd/connection_test.go
++++ b/internal/adapter/nbd/connection_test.go
+@@ -27,23 +27,25 @@ import (
+ //
+ // The durability accessors are here because BlockStore declares them; the
+ // constructor's values describe the common production shape (a durable local
+ // store with a durable remote and no strict enforcement), so a commit takes the
+ // localDurable fast path. A test that needs the strict path sets them itself.
+ type storeFake struct {
+ 	data     map[string][]byte
+ 	readErr  error
+ 	writeErr error
+ 	flushErr error
++	punchErr error
+ 	reads    int
+ 	writes   int
+ 	flushes  int
++	punches  int
+ 
+ 	localDurable   bool
+ 	remoteDurable  bool
+ 	requireDurable bool
+ 
+ 	// onFlush runs inside Flush before it returns, so a test can observe the
+ 	// store at the moment it is asked to commit. It is set before the server
+ 	// goroutine starts, never after.
+ 	onFlush func()
+ 
+@@ -96,20 +98,24 @@ func (s *storeFake) WriteAt(_ context.Context, id string, currentBlocks []block.
+ 	if end > uint64(len(s.data[id])) {
+ 		grown := make([]byte, end)
+ 		copy(grown, s.data[id])
+ 		s.data[id] = grown
+ 	}
+ 	copy(s.data[id][off:], data)
+ 	return currentBlocks, nil
+ }
+ 
+ func (s *storeFake) PunchHole(_ context.Context, id string, currentBlocks []block.ChunkRef, off, length uint64) ([]block.ChunkRef, error) {
++	s.punches++
++	if s.punchErr != nil {
++		return currentBlocks, s.punchErr
++	}
+ 	b := s.data[id]
+ 	for i := off; i < off+length && i < uint64(len(b)); i++ {
+ 		b[i] = 0
+ 	}
+ 	return currentBlocks, nil
+ }
+ 
+ func (s *storeFake) Flush(_ context.Context, _ string) (*block.FlushResult, error) {
+ 	s.flushes++
+ 	if s.onFlush != nil {
+@@ -125,25 +131,37 @@ func (s *storeFake) LocalDurable() bool         { return s.localDurable }
+ func (s *storeFake) RemoteDurable() bool        { return s.remoteDurable }
+ func (s *storeFake) RequireDurableCommit() bool { return s.requireDurable }
+ 
+ // testExportName is the export every connection test resolves.
+ const testExportName = "/export/boot"
+ 
+ // testPayloadID is the block-store payload the fixture export addresses.
+ const testPayloadID = "p1"
+ 
+ // testExport is the export the fixture resolves: a volume of size bytes whose
+-// data lives at testPayloadID.
++// data lives at testPayloadID. It is writable; readOnlyExport is the read-only
++// variant.
+ func testExport(size uint64) *Export {
+ 	return &Export{Name: testExportName, Size: size, PayloadID: testPayloadID}
+ }
+ 
++// readOnlyExport is testExport with the export-level read-only ceiling set.
++//
++// A second constructor rather than a mutation of testExport's return value:
++// tests share the value they build, so a test that flipped the flag on a shared
++// export would change what every other test resolves.
++func readOnlyExport(size uint64) *Export {
++	exp := testExport(size)
++	exp.ReadOnly = true
++	return exp
++}
++
+ // exporterFor returns an exporter that resolves testExportName to exp. It
+ // reuses fakeExporter from handshake_test.go, which is in this package.
+ func exporterFor(exp *Export) Exporter {
+ 	return &fakeExporter{exports: map[string]*Export{testExportName: exp}}
+ }
+ 
+ // resolverFor returns a StoreResolver that always hands back st.
+ func resolverFor(st BlockStore) StoreResolver {
+ 	return func(context.Context, *Export) (BlockStore, error) { return st, nil }
+ }
+@@ -686,24 +704,30 @@ func flagName(f CommandFlags) string {
+ 	case FlagFastZero:
+ 		return "NBD_CMD_FLAG_FAST_ZERO"
+ 	default:
+ 		return "flag"
+ 	}
+ }
+ 
+ // A client that sends a partial header and stalls must not hold the connection
+ // open forever, and must not make the server allocate for a length it never
+ // sent.
++//
++// Idle is the timer that bounds this wait: the connection has been silent since
++// the four bytes went out, so the arm that covers the wait for a header is the
++// Idle one. It is set below Read so the test would still fail if the arm read
++// Read — see TestConnection_IdleDeadlineClosesASilentConnection for the same
++// split with nothing sent at all.
+ func TestConnection_PartialHeaderTimesOut(t *testing.T) {
+ 	st := newStoreFake()
+ 	h := newTestHandler(st, testExport(8192),
+-		Timeouts{Read: 200 * time.Millisecond, Write: 5 * time.Second, Idle: 5 * time.Second})
++		Timeouts{Read: 5 * time.Second, Write: 5 * time.Second, Idle: 200 * time.Millisecond})
+ 	server, client := pipe(t)
+ 	done := serveConn(h, server)
+ 	completeHandshake(t, client, testExportName)
+ 
+ 	// Four bytes of the 28-byte header, then silence.
+ 	if _, err := client.Write([]byte{0x25, 0x60, 0x95, 0x13}); err != nil {
+ 		t.Fatalf("write partial header: %v", err)
+ 	}
+ 
+ 	select {
+@@ -1116,10 +1140,342 @@ func TestConnection_FlushOnReadOnlyExportIsPermitted(t *testing.T) {
+ 	client, _ := serveHandler(t, h, testExportName)
+ 
+ 	rep := flushThroughClient(t, client)
+ 	if rep.Error != 0 {
+ 		t.Fatalf("FLUSH on a read-only export reply error = %d, want 0", rep.Error)
+ 	}
+ 	if st.flushes != 1 {
+ 		t.Fatalf("the store saw %d flushes, want 1", st.flushes)
+ 	}
+ }
++
++// trimThroughClient sends one TRIM and returns the reply. TRIM carries no
++// payload, so there is nothing to send after the header.
++func trimThroughClient(t *testing.T, client net.Conn, offset uint64, length uint32, flags CommandFlags) *Reply {
++	t.Helper()
++	sendRequest(t, client, &Request{
++		Type: CmdTrim, Flags: flags, Cookie: 0x71, Offset: offset, Length: length,
++	})
++	return readReplyHeader(t, client)
++}
++
++// writeZeroesThroughClient sends one WRITE_ZEROES and returns the reply. Like
++// TRIM it carries no payload.
++func writeZeroesThroughClient(t *testing.T, client net.Conn, offset uint64, length uint32, flags CommandFlags) *Reply {
++	t.Helper()
++	sendRequest(t, client, &Request{
++		Type: CmdWriteZeroes, Flags: flags, Cookie: 0x72, Offset: offset, Length: length,
++	})
++	return readReplyHeader(t, client)
++}
++
++// A read-only export refuses a TRIM with NBD_EPERM. The export still advertises
++// SEND_TRIM while read-only — handshake.go sets it unconditionally and only adds
++// READ_ONLY — so this is not a client violating the advertisement; it is the
++// case the spec's error list names explicitly: "it SHOULD return NBD_EPERM if it
++// receives a write or trim request on a read-only export".
++func TestConnection_TrimIsEPERMOnReadOnlyExport(t *testing.T) {
++	st := newStoreFake()
++	h := newTestHandler(st, readOnlyExport(8192), testTimeouts())
++	client, _ := serveHandler(t, h, testExportName)
++
++	if rep := trimThroughClient(t, client, 0, 4096, 0); rep.Error != ErrEPERM {
++		t.Fatalf("TRIM on a read-only export reply error = %d, want ErrEPERM (%d)", rep.Error, uint32(ErrEPERM))
++	}
++	if st.punches != 0 {
++		t.Fatalf("the store saw %d punches for a refused TRIM", st.punches)
++	}
++}
++
++// The trimmed range reads back as zeros and the range before it is untouched.
++// It needs the real-metadata fixture: the handler calls h.meta.PunchHole, and
++// newTestHandler passes nil for meta.
++func TestConnection_TrimThenReadIsZeros(t *testing.T) {
++	f := newWriteVolumeFixture(t)
++	st := newStoreFake()
++	h := f.newHandler(t, st)
++	client, _ := serveHandler(t, h, f.exp.Name)
++
++	want := make([]byte, 8192)
++	for i := range want {
++		want[i] = byte(i%251) + 1
++	}
++	if rep := writeThroughClient(t, client, 0, want, 0); rep.Error != 0 {
++		t.Fatalf("WRITE reply error = %d, want 0", rep.Error)
++	}
++
++	if rep := trimThroughClient(t, client, 4096, 4096, 0); rep.Error != 0 {
++		t.Fatalf("TRIM reply error = %d, want 0", rep.Error)
++	}
++	if st.punches != 1 {
++		t.Fatalf("the store saw %d punches, want 1", st.punches)
++	}
++
++	rep, kept := readReplyAndPayload(t, client, &Request{Type: CmdRead, Cookie: 0x73, Offset: 0, Length: 4096})
++	if rep.Error != 0 {
++		t.Fatalf("READ below the trimmed range returned error %d, want 0", rep.Error)
++	}
++	if !bytes.Equal(kept, want[:4096]) {
++		t.Fatal("READ below the trimmed range did not return the bytes that were written")
++	}
++
++	rep, trimmed := readReplyAndPayload(t, client, &Request{Type: CmdRead, Cookie: 0x74, Offset: 4096, Length: 4096})
++	if rep.Error != 0 {
++		t.Fatalf("READ of the trimmed range returned error %d, want 0", rep.Error)
++	}
++	if !bytes.Equal(trimmed, make([]byte, 4096)) {
++		t.Fatal("READ of the trimmed range did not return zeros")
++	}
++}
++
++// A TRIM whose length runs past the export end is refused, not clamped. The
++// spec: "it SHOULD return NBD_EINVAL if it receives a read or trim request
++// including one or more sectors beyond the size of the device." READ already
++// answers EINVAL past the end, and the same condition deserves the same answer.
++func TestConnection_TrimPastEndIsEINVAL(t *testing.T) {
++	st := newStoreFake()
++	h := newTestHandler(st, testExport(8192), testTimeouts())
++	client, _ := serveHandler(t, h, testExportName)
++
++	// 4096 bytes starting at 4096 ends exactly at the export end and is
++	// permitted; one byte more is the smallest out-of-range request.
++	if rep := trimThroughClient(t, client, 4096, 4097, 0); rep.Error != ErrEINVAL {
++		t.Fatalf("TRIM past the export end reply error = %d, want ErrEINVAL (%d)", rep.Error, uint32(ErrEINVAL))
++	}
++	if st.punches != 0 {
++		t.Fatalf("the store saw %d punches for a request past the export end", st.punches)
++	}
++}
++
++// An offset at or past the export end is refused on its own check. It is
++// asserted separately because it is the case a subtraction-based clamp
++// underflows on: end-offset with end == size and offset > size wraps to a value
++// near 2^64, which the engine's overflow guard then reports as a confusing
++// "punch range overflow" instead of the right answer.
++func TestConnection_TrimOffsetPastEndIsEINVAL(t *testing.T) {
++	st := newStoreFake()
++	h := newTestHandler(st, testExport(8192), testTimeouts())
++	client, _ := serveHandler(t, h, testExportName)
++
++	if rep := trimThroughClient(t, client, 8192, 100, 0); rep.Error != ErrEINVAL {
++		t.Fatalf("TRIM at the export end reply error = %d, want ErrEINVAL (%d)", rep.Error, uint32(ErrEINVAL))
++	}
++	if rep := trimThroughClient(t, client, 10000, 100, 0); rep.Error != ErrEINVAL {
++		t.Fatalf("TRIM past the export end reply error = %d, want ErrEINVAL (%d)", rep.Error, uint32(ErrEINVAL))
++	}
++	if st.punches != 0 {
++		t.Fatalf("the store saw %d punches for an out-of-range TRIM", st.punches)
++	}
++}
++
++// WRITE_ZEROES past the end is NBD_ENOSPC, not EINVAL: the spec gives it its own
++// rule — "The server SHOULD return NBD_ENOSPC if it receives a write zeroes
++// request including one or more sectors beyond the size of the device."
++func TestConnection_WriteZeroesPastEndIsENOSPC(t *testing.T) {
++	st := newStoreFake()
++	h := newTestHandler(st, testExport(8192), testTimeouts())
++	client, _ := serveHandler(t, h, testExportName)
++
++	if rep := writeZeroesThroughClient(t, client, 4096, 4097, 0); rep.Error != ErrENOSPC {
++		t.Fatalf("WRITE_ZEROES past the export end reply error = %d, want ErrENOSPC (%d)", rep.Error, uint32(ErrENOSPC))
++	}
++	if st.punches != 0 {
++		t.Fatalf("the store saw %d punches for a request past the export end", st.punches)
++	}
++}
++
++// NO_HOLE must be accepted, not rejected: "The server MUST support the use of
++// this flag if it advertises NBD_FLAG_SEND_WRITE_ZEROES", and the adapter does.
++// It is the client asking that the range be genuinely allocated rather than left
++// sparse, and PunchHole already zero-overwrites rather than leaving a hole, so
++// honouring it takes no extra work. Refusing it would break a MUST on the
++// strength of the rule that makes NO_HOLE invalid on WRITE.
++func TestConnection_WriteZeroesWithNoHoleIsAccepted(t *testing.T) {
++	f := newWriteVolumeFixture(t)
++	st := newStoreFake()
++	h := f.newHandler(t, st)
++	client, _ := serveHandler(t, h, f.exp.Name)
++
++	if rep := writeZeroesThroughClient(t, client, 0, 4096, FlagNoHole); rep.Error != 0 {
++		t.Fatalf("WRITE_ZEROES with NBD_CMD_FLAG_NO_HOLE reply error = %d, want 0", rep.Error)
++	}
++	if st.punches != 1 {
++		t.Fatalf("the store saw %d punches, want 1", st.punches)
++	}
++}
++
++// A zero-length TRIM is NBD_EINVAL, the same answer READ, WRITE and
++// WRITE_ZEROES give. TRIM carries no payload either way, so the connection must
++// stay usable for the next command.
++func TestConnection_TrimZeroLengthIsEINVAL(t *testing.T) {
++	st := newStoreFake()
++	st.data[testPayloadID] = make([]byte, 4096)
++	h := newTestHandler(st, testExport(8192), testTimeouts())
++	client, _ := serveHandler(t, h, testExportName)
++
++	if rep := trimThroughClient(t, client, 0, 0, 0); rep.Error != ErrEINVAL {
++		t.Fatalf("zero-length TRIM reply error = %d, want ErrEINVAL (%d)", rep.Error, uint32(ErrEINVAL))
++	}
++	if st.punches != 0 {
++		t.Fatalf("the store saw %d punches for a zero-length request", st.punches)
++	}
++
++	// The READ proves the zero-length path left the stream where it found it: a
++	// handler that drained a payload it never received would consume this
++	// header.
++	rep, got := readReplyAndPayload(t, client, &Request{Type: CmdRead, Cookie: 0x75, Offset: 0, Length: 4096})
++	if rep.Error != 0 {
++		t.Fatalf("READ after a zero-length TRIM returned error %d; the zero-length path consumed the next header", rep.Error)
++	}
++	if len(got) != 4096 {
++		t.Fatalf("READ after a zero-length TRIM returned %d bytes, want 4096", len(got))
++	}
++}
++
++// A zero-length WRITE_ZEROES is NBD_EINVAL, matching READ and WRITE. No payload
++// either way, so the connection must stay usable.
++func TestConnection_WriteZeroesZeroLengthIsEINVAL(t *testing.T) {
++	st := newStoreFake()
++	st.data[testPayloadID] = make([]byte, 4096)
++	h := newTestHandler(st, testExport(8192), testTimeouts())
++	client, _ := serveHandler(t, h, testExportName)
++
++	if rep := writeZeroesThroughClient(t, client, 0, 0, 0); rep.Error != ErrEINVAL {
++		t.Fatalf("zero-length WRITE_ZEROES reply error = %d, want ErrEINVAL (%d)", rep.Error, uint32(ErrEINVAL))
++	}
++	if st.punches != 0 {
++		t.Fatalf("the store saw %d punches for a zero-length request", st.punches)
++	}
++
++	rep, got := readReplyAndPayload(t, client, &Request{Type: CmdRead, Cookie: 0x76, Offset: 0, Length: 4096})
++	if rep.Error != 0 {
++		t.Fatalf("READ after a zero-length WRITE_ZEROES returned error %d; the zero-length path consumed the next header", rep.Error)
++	}
++	if len(got) != 4096 {
++		t.Fatalf("READ after a zero-length WRITE_ZEROES returned %d bytes, want 4096", len(got))
++	}
++}
++
++// The assertion that keeps WRITE_ZEROES from becoming a zero-buffer WriteAt: on
++// a content-addressed store that call MATERIALIZES real zero chunks, so a
++// filesystem's discard path would allocate storage instead of freeing it. The
++// punches/writes counters are the guard, and the read back is what proves the
++// range is zeros either way.
++func TestConnection_WriteZeroesThenReadIsZeros(t *testing.T) {
++	f := newWriteVolumeFixture(t)
++	st := newStoreFake()
++	// Pre-populated rather than written through the handler, so st.writes stays
++	// zero for a reason the assertion can see: a WRITE_ZEROES that went through
++	// WriteAt would increment it.
++	nonzero := make([]byte, 4096)
++	for i := range nonzero {
++		nonzero[i] = byte(i%251) + 1
++	}
++	st.data[string(f.exp.PayloadID)] = nonzero
++
++	h := f.newHandler(t, st)
++	client, _ := serveHandler(t, h, f.exp.Name)
++
++	if rep := writeZeroesThroughClient(t, client, 0, 4096, 0); rep.Error != 0 {
++		t.Fatalf("WRITE_ZEROES reply error = %d, want 0", rep.Error)
++	}
++	if st.punches != 1 {
++		t.Fatalf("the store saw %d punches, want 1", st.punches)
++	}
++	if st.writes != 0 {
++		t.Fatalf("the store saw %d writes, want 0: WRITE_ZEROES must punch, not write a zero buffer", st.writes)
++	}
++
++	rep, got := readReplyAndPayload(t, client, &Request{Type: CmdRead, Cookie: 0x77, Offset: 0, Length: 4096})
++	if rep.Error != 0 {
++		t.Fatalf("READ of the zeroed range returned error %d, want 0", rep.Error)
++	}
++	if !bytes.Equal(got, make([]byte, 4096)) {
++		t.Fatal("READ of the zeroed range did not return zeros")
++	}
++}
++
++// WRITE_ZEROES is a write, so a read-only export refuses it.
++func TestConnection_WriteZeroesOnReadOnlyExportIsEPERM(t *testing.T) {
++	st := newStoreFake()
++	h := newTestHandler(st, readOnlyExport(8192), testTimeouts())
++	client, _ := serveHandler(t, h, testExportName)
++
++	if rep := writeZeroesThroughClient(t, client, 0, 4096, 0); rep.Error != ErrEPERM {
++		t.Fatalf("WRITE_ZEROES on a read-only export reply error = %d, want ErrEPERM (%d)", rep.Error, uint32(ErrEPERM))
++	}
++	if st.punches != 0 {
++		t.Fatalf("the store saw %d punches for a refused WRITE_ZEROES", st.punches)
++	}
++}
++
++// Read-only means writes are refused, not that the device is unusable: a client
++// mounting a read-only export still reads it.
++func TestConnection_ReadOnReadOnlyExportSucceeds(t *testing.T) {
++	want := make([]byte, 4096)
++	for i := range want {
++		want[i] = byte(i%251) + 1
++	}
++	st := newStoreFake()
++	st.data[testPayloadID] = want
++
++	h := newTestHandler(st, readOnlyExport(8192), testTimeouts())
++	client, _ := serveHandler(t, h, testExportName)
++
++	rep, got := readReplyAndPayload(t, client, &Request{Type: CmdRead, Cookie: 0x78, Offset: 0, Length: 4096})
++	if rep.Error != 0 {
++		t.Fatalf("READ on a read-only export returned error %d, want 0", rep.Error)
++	}
++	if !bytes.Equal(got, want) {
++		t.Fatal("READ on a read-only export did not return the stored bytes")
++	}
++}
++
++// A WRITE on a read-only export is NBD_EPERM, checked before the range and the
++// store: a read-only export refuses the write wherever it lands. The payload
++// still goes out and is still drained, so the connection stays synchronized.
++func TestConnection_WriteOnReadOnlyExportIsEPERM(t *testing.T) {
++	st := newStoreFake()
++	h := newTestHandler(st, readOnlyExport(8192), testTimeouts())
++	client, _ := serveHandler(t, h, testExportName)
++
++	if rep := writeThroughClient(t, client, 0, make([]byte, 4096), 0); rep.Error != ErrEPERM {
++		t.Fatalf("WRITE on a read-only export reply error = %d, want ErrEPERM (%d)", rep.Error, uint32(ErrEPERM))
++	}
++	if st.writes != 0 {
++		t.Fatalf("the store saw %d writes for a refused request", st.writes)
++	}
++
++	rep, got := readReplyAndPayload(t, client, &Request{Type: CmdRead, Cookie: 0x79, Offset: 0, Length: 4096})
++	if rep.Error != 0 {
++		t.Fatalf("READ after a refused WRITE returned error %d; the refused payload was read as the next request header", rep.Error)
++	}
++	if len(got) != 4096 {
++		t.Fatalf("READ after a refused WRITE returned %d bytes, want 4096", len(got))
++	}
++}
++
++// Idle bounds the wait for a request header, so a connection that completes its
++// handshake and then sends nothing is closed by the Idle timer.
++//
++// The values are the point: Idle is SHORTER than Read, so the test fails if the
++// arm reads Read instead. With Idle == Read or Idle > Read it would pass whether
++// or not the arm exists — which is why the committed
++// TestConnection_PartialHeaderTimesOut (Idle 5s / Read 200ms) cannot catch the
++// missing arm.
++func TestConnection_IdleDeadlineClosesASilentConnection(t *testing.T) {
++	st := newStoreFake()
++	h := newTestHandler(st, testExport(8192),
++		Timeouts{Read: 5 * time.Second, Write: 5 * time.Second, Idle: 200 * time.Millisecond})
++	client, done := serveHandler(t, h, testExportName)
++
++	// Silence from here: the handshake is complete and no request follows.
++	select {
++	case err := <-done:
++		if err == nil {
++			t.Fatal("serve returned nil after the idle timeout; a silent connection must end")
++		}
++	case <-time.After(2 * time.Second):
++		t.Fatal("serve did not return within 2s of a 200ms idle timeout: Timeouts.Idle is not armed")
++	}
++	_ = client.Close()
++}
+diff --git a/internal/adapter/nbd/handlers_write.go b/internal/adapter/nbd/handlers_write.go
+index 8c85e7a9..ca231485 100644
+--- a/internal/adapter/nbd/handlers_write.go
++++ b/internal/adapter/nbd/handlers_write.go
+@@ -55,20 +55,29 @@ func (h *Handler) handleWrite(ctx context.Context, bs BlockStore, exp *Export, r
+ 
+ 	// A write past the end is NBD_ENOSPC, not NBD_EINVAL: the spec reserves
+ 	// EINVAL for a read or trim past the end, because a write past the end
+ 	// means the client's view of the device is too large while a read or trim
+ 	// past the end is a malformed request. The export size is fixed at volume
+ 	// creation, so a write never grows it.
+ 	if req.Offset+uint64(req.Length) > exp.Size {
+ 		return h.rejectWrite(conn, req, ErrENOSPC)
+ 	}
+ 
++	// Read bounds finishing a request that has already started. The header read
++	// consumed the budget armed in the dispatch loop, and that budget is the
++	// Idle one when the operator has separated the two — so without a fresh arm
++	// here the payload read inherits the wrong timer and Read bounds nothing at
++	// all. The same arm, from the same field, is what makes the split real.
++	if err := conn.SetReadDeadline(time.Now().Add(h.timeouts.Read)); err != nil {
++		return err
++	}
++
+ 	// The payload is read into a buffer sized to the request. LimitReader
+ 	// bounds the read to the declared length, so a client that sends more than
+ 	// it declared cannot make the server consume the next request header as
+ 	// payload.
+ 	data := make([]byte, req.Length)
+ 	if _, err := io.ReadFull(io.LimitReader(conn, int64(req.Length)), data); err != nil {
+ 		// The client stopped mid-payload on a request the server had already
+ 		// accepted, so the stream position is unknown: returning ends Serve,
+ 		// which closes the connection. A success reply for bytes the server
+ 		// never saw is the one answer that must not be sent.
+@@ -108,20 +117,158 @@ func (h *Handler) handleWrite(ctx context.Context, bs BlockStore, exp *Export, r
+ 	// already had the guarantee it asked for.
+ 	if req.Flags&FlagFUA != 0 {
+ 		if err := h.commit(ctx, bs, exp); err != nil {
+ 			return h.writeReply(conn, req.Cookie, mapError(err), nil)
+ 		}
+ 	}
+ 
+ 	return h.writeReply(conn, req.Cookie, 0, nil)
+ }
+ 
++// handleTrim serves one NBD_CMD_TRIM.
++//
++// decision: TRIM is served by PunchHole, which zero-overwrites the range rather
++// than leaving its contents undefined. The spec permits either — "A server MAY
++// discard length bytes starting at offset, but is not required to" — and it also
++// says a client "MUST NOT make any assumptions about the contents of the export
++// affected by this command", so zeros are a legal answer and the only
++// deterministic one. The alternative, a cheaper discard that leaves reads
++// non-deterministic, is the far worse property: the zero chunks dedup to a
++// single CAS object, so the over-delivery costs almost nothing in aggregate.
++func (h *Handler) handleTrim(ctx context.Context, bs BlockStore, exp *Export, req *Request, conn net.Conn) error {
++	return h.handleDiscard(ctx, bs, exp, req, conn, FlagFUA, ErrEINVAL)
++}
++
++// handleWriteZeroes serves one NBD_CMD_WRITE_ZEROES.
++//
++// decision: the range is punched, never written as a zero buffer. Writing zeros
++// through WriteAt is the reference library's bug: on a content-addressed store
++// it MATERIALIZES real zero chunks, so a filesystem's discard path allocates
++// storage instead of freeing it. PunchHole reclaims the chunks that fall
++// entirely inside the range and zero-overwrites the rest, which is why the unit
++// test's `st.punches == 1` and `st.writes == 0` is the guard on this decision.
++//
++// NO_HOLE is accepted: the spec says "The server MUST support the use of this
++// flag if it advertises NBD_FLAG_SEND_WRITE_ZEROES", and the adapter does. It is
++// the client asking that the range be genuinely allocated rather than left
++// sparse, and PunchHole already zero-overwrites rather than leaving a hole, so
++// honouring it takes no extra work. Refusing it would break a MUST on the
++// strength of the rule that makes NO_HOLE invalid on WRITE.
++func (h *Handler) handleWriteZeroes(ctx context.Context, bs BlockStore, exp *Export, req *Request, conn net.Conn) error {
++	return h.handleDiscard(ctx, bs, exp, req, conn, FlagFUA|FlagNoHole, ErrENOSPC)
++}
++
++// handleDiscard is the shared body of TRIM and WRITE_ZEROES: the two commands
++// differ only in which flags they document and which error the spec gives an
++// out-of-range range, so those two values are the parameters and everything else
++// is one implementation.
++//
++// The checks run in this order — flags, read-only, zero length, overflow, past
++// the end, then the store — the same order handleWrite uses and for the same
++// reason: the range check reads the request's own fields, so it cannot be
++// trusted until they have been shown to make sense.
++func (h *Handler) handleDiscard(ctx context.Context, bs BlockStore, exp *Export, req *Request, conn net.Conn, allowed CommandFlags, outOfRange NBDError) error {
++	// A flag that is not documented for this command is a malformed request.
++	// FUA is accepted on both, because the spec requires the server to accept it
++	// on every command once SEND_FUA is advertised. NO_HOLE is accepted on
++	// WRITE_ZEROES only.
++	if req.Flags&^allowed != 0 {
++		return h.writeReply(conn, req.Cookie, ErrEINVAL, nil)
++	}
++
++	// Checked before the length and the range: a read-only export refuses the
++	// mutation wherever it lands. The export still advertises SEND_TRIM and
++	// SEND_WRITE_ZEROES while read-only (handshake.go sets both unconditionally
++	// and only adds READ_ONLY), so this is not a client violating the
++	// advertisement — it is the case the spec's error list names explicitly: "it
++	// SHOULD return NBD_EPERM if it receives a write or trim request on a
++	// read-only export".
++	if exp.ReadOnly {
++		return h.writeReply(conn, req.Cookie, ErrEPERM, nil)
++	}
++
++	// Neither command carries a payload, so a rejection is answered without a
++	// drain: there are no bytes in flight to consume, and draining here would
++	// read the next request header as payload.
++	if req.Length == 0 {
++		return h.writeReply(conn, req.Cookie, ErrEINVAL, nil)
++	}
++
++	// A subtraction rather than offset+length, which wraps: a request far past
++	// the end would otherwise look like it starts inside the export. The same
++	// guard handleRead uses, for the same reason.
++	if req.Offset > math.MaxUint64-uint64(req.Length) {
++		return h.writeReply(conn, req.Cookie, ErrEIO, nil)
++	}
++
++	// Out of range is refused, never clamped, and these two checks are what make
++	// the clamp unnecessary. A clamp written as end-offset underflows when the
++	// offset is already past the end (offset=10000, length=100, size=8192 gives
++	// 18446744073709549808), and the engine's own overflow guard would then
++	// report a confusing "punch range overflow" instead of the right answer.
++	//
++	// decision: the two commands answer different codes here, because the spec
++	// gives them different rules — "it SHOULD return NBD_EINVAL if it receives a
++	// read or trim request including one or more sectors beyond the size of the
++	// device", while "The server SHOULD return NBD_ENOSPC if it receives a write
++	// zeroes request including one or more sectors beyond the size of the
++	// device". outOfRange carries the caller's code.
++	if req.Offset >= exp.Size {
++		return h.writeReply(conn, req.Cookie, outOfRange, nil)
++	}
++
++	// The last byte of the export is addressable, so a range that ends exactly
++	// at the end is served.
++	if req.Offset+uint64(req.Length) > exp.Size {
++		return h.writeReply(conn, req.Cookie, outOfRange, nil)
++	}
++
++	// The metadata punch is not optional, and it is not only about reclaim.
++	//
++	// It is the only authorization check on this path: metadata.Service.PunchHole
++	// calls checkWritePermission (pkg/metadata/sparse.go:80) while
++	// engine.Store.PunchHole checks nothing, so a discard that went straight to
++	// the engine would be the one mutating command in the adapter that no
++	// permission funnel sees — and it destroys data.
++	//
++	// And without it the storage is never freed: engine.Store.PunchHole does the
++	// reap (DecrementRefCountAndReapMany plus ReprojectBlocks) only inside
++	// `if len(currentBlocks) > 0` (pkg/block/engine/readwrite.go:308), so calling
++	// it with nil skips the reap and only zero-overwrites the range. The command
++	// would look like it worked and free nothing, which is the one thing a
++	// discard exists to do. res.PreOpBlocks is the pre-op snapshot the reap needs
++	// and res.PayloadID is the payload the file actually addresses.
++	//
++	// Built per command and never cached, for the same reason handleWrite builds
++	// its own: it embeds the command's Context.
++	authCtx := h.authContext(ctx, exp)
++	res, err := h.meta.PunchHole(authCtx, exp.Handle, req.Offset, uint64(req.Length))
++	if err != nil {
++		return h.writeReply(conn, req.Cookie, mapError(err), nil)
++	}
++	if _, err := bs.PunchHole(ctx, string(res.PayloadID), res.PreOpBlocks, req.Offset, uint64(req.Length)); err != nil {
++		return h.writeReply(conn, req.Cookie, mapError(err), nil)
++	}
++
++	// FUA must be durable before the reply, exactly as WRITE does: the spec says
++	// the server "MUST NOT send its reply to that command until all write
++	// operations ... have been completed and persisted to non-volatile storage".
++	if req.Flags&FlagFUA != 0 {
++		if err := h.commit(ctx, bs, exp); err != nil {
++			return h.writeReply(conn, req.Cookie, mapError(err), nil)
++		}
++	}
++
++	// Neither command has a reply payload.
++	return h.writeReply(conn, req.Cookie, 0, nil)
++}
++
+ // rejectWrite answers a write that failed a check and then consumes the payload
+ // the client has already sent.
+ //
+ // The spec requires the client to follow the request header with length bytes
+ // unconditionally, so a rejection that returns without consuming them leaves
+ // the next request header to be read out of payload bytes. The connection then
+ // desynchronizes into garbage, and the symptom appears on an unrelated command
+ // minutes later.
+ //
+ // decision: the reply is written before the drain. The reply travels
+diff --git a/internal/adapter/nbd/integration_test.go b/internal/adapter/nbd/integration_test.go
+index 999ceae2..80987b0f 100644
+--- a/internal/adapter/nbd/integration_test.go
++++ b/internal/adapter/nbd/integration_test.go
+@@ -1,15 +1,16 @@
+ package nbd
+ 
+ import (
+ 	"bytes"
+ 	"context"
++	"net"
+ 	"testing"
+ 
+ 	"github.com/marmos91/dittofs/internal/adapter/common"
+ 	"github.com/marmos91/dittofs/internal/adapter/testruntime"
+ 	"github.com/marmos91/dittofs/pkg/block/engine"
+ 	"github.com/marmos91/dittofs/pkg/controlplane/models"
+ 	"github.com/marmos91/dittofs/pkg/controlplane/runtime"
+ 	"github.com/marmos91/dittofs/pkg/metadata"
+ 	"github.com/marmos91/dittofs/pkg/metadata/store/badger/badgertest"
+ )
+@@ -404,10 +405,145 @@ func TestIntegration_WriteThenFlushThenReadBackByteExact(t *testing.T) {
+ 	}
+ 
+ 	rep, got := readReplyAndPayload(t, client, &Request{Type: CmdRead, Cookie: 0x79, Offset: 0, Length: size})
+ 	if rep.Error != 0 {
+ 		t.Fatalf("READ reply error = %d, want 0", rep.Error)
+ 	}
+ 	if !bytes.Equal(got, want) {
+ 		t.Fatalf("READ returned %d bytes that do not match what was written", len(got))
+ 	}
+ }
++
++// manifestBytes is the number of payload bytes the file's block list
++// references. It is the observable a punch moves: metadata.Service.PunchHole
++// prunes file.Blocks and persists the pruned manifest, and that pruning is the
++// reclaim.
++func manifestBytes(file *metadata.File) uint64 {
++	var total uint64
++	for _, b := range file.Blocks {
++		total += uint64(b.Size)
++	}
++	return total
++}
++
++// integrationManifest reads the volume's manifest through the metadata service,
++// which is how a test sees what a punch pruned.
++func integrationManifest(t *testing.T, rt *runtime.Runtime, exp *Export) *metadata.File {
++	t.Helper()
++	file, err := rt.GetMetadataService().GetFile(context.Background(), exp.Handle)
++	if err != nil {
++		t.Fatalf("GetFile: %v", err)
++	}
++	return file
++}
++
++// integrationWriteFixtureBytes writes size bytes of incompressible-looking data
++// into the fixture's volume through the handler and returns the handler's
++// connection so the caller can drive the next command on it.
++//
++// The manifest is populated before returning, and asserted to be populated:
++// Flush alone is not enough — with a durable local store it returns before the
++// remote drain (pkg/block/engine/flush.go:554), so file.Blocks is still empty
++// and a punch would have nothing to prune. A test written without
++// DrainAllUploads passes for the wrong reason.
++func integrationWriteFixtureBytes(t *testing.T, f *writeVolumeFixture, size int) (net.Conn, chan error) {
++	t.Helper()
++	h := f.newHandler(t, f.bs)
++	client, done := serveHandler(t, h, f.exp.Name)
++
++	want := make([]byte, size)
++	rng := uint32(0x9e3779b9)
++	for i := range want {
++		rng ^= rng << 13
++		rng ^= rng >> 17
++		rng ^= rng << 5
++		want[i] = byte(rng)
++	}
++	if rep := writeThroughClient(t, client, 0, want, 0); rep.Error != 0 {
++		t.Fatalf("WRITE reply error = %d, want 0", rep.Error)
++	}
++	if rep := flushThroughClient(t, client); rep.Error != 0 {
++		t.Fatalf("FLUSH reply error = %d, want 0", rep.Error)
++	}
++	ctx := context.Background()
++	if err := f.bs.DrainAllUploads(ctx); err != nil {
++		t.Fatalf("DrainAllUploads: %v", err)
++	}
++	if got := len(integrationManifest(t, f.rt, f.exp).Blocks); got == 0 {
++		t.Fatal("the manifest is empty after Flush and DrainAllUploads, so a punch has nothing to prune")
++	}
++	return client, done
++}
++
++// TestIntegration_TrimFreesAndReadsZero is TRIM over a real engine.Store: the
++// punched range reads back as zeros and the manifest shrinks.
++//
++// The manifest is asserted rather than the extent map on purpose. The punch
++// zero-overwrites the range through the local append log, so the local tier
++// keeps reporting an interval over it, and DataExtents over-reports by
++// documented contract (pkg/block/engine/dataextents.go:41, "may over-report data
++// but must never under-report it"). Asserting that DataExtents stops reporting
++// the punched range is unsatisfiable. The manifest is the observable: it is what
++// the reclaim prunes.
++func TestIntegration_TrimFreesAndReadsZero(t *testing.T) {
++	f := newWriteVolumeFixture(t)
++	client, _ := integrationWriteFixtureBytes(t, f, 1<<20)
++
++	before := integrationManifest(t, f.rt, f.exp)
++
++	// The export is exactly 1 MiB, so the punch covers the whole device and
++	// contains the single chunk the fixture's write produced. An out-of-range
++	// punch is refused (and has its own tests), so the range is the export's.
++	if rep := trimThroughClient(t, client, 0, 1<<20, 0); rep.Error != 0 {
++		t.Fatalf("TRIM reply error = %d, want 0", rep.Error)
++	}
++
++	after := integrationManifest(t, f.rt, f.exp)
++	if len(after.Blocks) >= len(before.Blocks) {
++		t.Fatalf("manifest has %d blocks after the punch, want fewer than the %d before it",
++			len(after.Blocks), len(before.Blocks))
++	}
++	if got, was := manifestBytes(after), manifestBytes(before); got >= was {
++		t.Fatalf("manifest references %d bytes after the punch, want fewer than the %d before it", got, was)
++	}
++
++	rep, got := readReplyAndPayload(t, client, &Request{Type: CmdRead, Cookie: 0x7a, Offset: 0, Length: 4096})
++	if rep.Error != 0 {
++		t.Fatalf("READ of the trimmed range returned error %d, want 0", rep.Error)
++	}
++	if !bytes.Equal(got, make([]byte, 4096)) {
++		t.Fatal("READ of the trimmed range did not return zeros")
++	}
++}
++
++// TestIntegration_WriteZeroesDoesNotMaterializeChunks is the assertion that
++// keeps WRITE_ZEROES from becoming a zero-buffer WriteAt. On a
++// content-addressed store that call MATERIALIZES a real zero chunk, so a
++// filesystem's discard path would allocate storage instead of freeing it — the
++// reference library's bug. The manifest must shrink, not grow.
++func TestIntegration_WriteZeroesDoesNotMaterializeChunks(t *testing.T) {
++	f := newWriteVolumeFixture(t)
++	client, _ := integrationWriteFixtureBytes(t, f, 1<<20)
++
++	before := integrationManifest(t, f.rt, f.exp)
++
++	if rep := writeZeroesThroughClient(t, client, 0, 1<<20, 0); rep.Error != 0 {
++		t.Fatalf("WRITE_ZEROES reply error = %d, want 0", rep.Error)
++	}
++
++	after := integrationManifest(t, f.rt, f.exp)
++	if len(after.Blocks) >= len(before.Blocks) {
++		t.Fatalf("manifest has %d blocks after WRITE_ZEROES, want fewer than the %d before it: a zero-buffer WriteAt would materialize a new chunk",
++			len(after.Blocks), len(before.Blocks))
++	}
++	if got, was := manifestBytes(after), manifestBytes(before); got >= was {
++		t.Fatalf("manifest references %d bytes after WRITE_ZEROES, want fewer than the %d before it", got, was)
++	}
++
++	rep, got := readReplyAndPayload(t, client, &Request{Type: CmdRead, Cookie: 0x7b, Offset: 0, Length: 4096})
++	if rep.Error != 0 {
++		t.Fatalf("READ of the zeroed range returned error %d, want 0", rep.Error)
++	}
++	if !bytes.Equal(got, make([]byte, 4096)) {
++		t.Fatal("READ of the zeroed range did not return zeros")
++	}
++}
+diff --git a/pkg/adapter/nbd/config.go b/pkg/adapter/nbd/config.go
+index 8fca6dd1..ae400774 100644
+--- a/pkg/adapter/nbd/config.go
++++ b/pkg/adapter/nbd/config.go
+@@ -22,31 +22,34 @@ const DefaultMaxMessageSize = 32 << 20
+ // metadata operations as when the operator configures none: nobody/nogroup.
+ // NBD carries no user identity at all, so every operation runs as this one
+ // synthetic identity, and UID 0 would hand every client root on the volume.
+ const (
+ 	DefaultUID = uint32(65534)
+ 	DefaultGID = uint32(65534)
+ )
+ 
+ // TimeoutsConfig groups the operator-facing timers for an NBD connection.
+ type TimeoutsConfig struct {
+-	// Read is the maximum duration for reading a complete request from a
+-	// client. It bounds a client that has completed its handshake but then
+-	// stalls mid-request.
++	// Read is the maximum duration for finishing a request that has already
++	// started: once a request header has been parsed, this bounds reading its
++	// payload. The wait for a header is bounded by Idle instead, because a
++	// client that has sent nothing is idle rather than slow.
+ 	Read time.Duration `mapstructure:"read"`
+ 
+ 	// Write is the maximum duration for writing a reply to a client. It
+ 	// bounds a client that stops reading.
+ 	Write time.Duration `mapstructure:"write"`
+ 
+ 	// Idle is the maximum duration a connection may remain idle between
+-	// requests before the adapter closes it. 0 means no idle timeout.
++	// requests before the adapter closes it. It bounds the wait for a request
++	// header, so a client that stops part-way through one is also covered. 0
++	// means no idle timeout.
+ 	Idle time.Duration `mapstructure:"idle"`
+ 
+ 	// Shutdown is the maximum duration to wait for in-flight connections to
+ 	// finish during graceful shutdown. It is handed to the base adapter, which
+ 	// owns the drain deadline.
+ 	Shutdown time.Duration `mapstructure:"shutdown"`
+ }
+ 
+ // Config holds the operator-facing configuration for the NBD adapter.
+ //

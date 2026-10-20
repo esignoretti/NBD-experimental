@@ -1,0 +1,353 @@
+# Review package: 283105a1..df69c170
+
+## Commits
+df69c170 docs(nbd): plan the disabled-share gate and the file-handle assertion
+d9f8e7af fix(nbd): refuse and omit a disabled share at export resolution
+
+## Files changed
+ .../plans/2026-10-08-dittofs-nbd-block-protocol.md | 79 +++++++++++++++++++++-
+ internal/adapter/nbd/volume.go                     | 22 ++++++
+ internal/adapter/nbd/volume_test.go                | 75 ++++++++++++++++++++
+ 3 files changed, 175 insertions(+), 1 deletion(-)
+
+## Diff
+diff --git a/docs/superpowers/plans/2026-10-08-dittofs-nbd-block-protocol.md b/docs/superpowers/plans/2026-10-08-dittofs-nbd-block-protocol.md
+index 857c9ac0..21488415 100644
+--- a/docs/superpowers/plans/2026-10-08-dittofs-nbd-block-protocol.md
++++ b/docs/superpowers/plans/2026-10-08-dittofs-nbd-block-protocol.md
+@@ -846,36 +846,44 @@ authCtx := &metadata.AuthContext{
+ 	Identity: &metadata.Identity{UID: &uid, GID: &gid},
+ }
+ ```
+ 
+ **Do not** set `ShareReadOnly` here. This is an internal resolution against a share the operator already configured, not a client operation; the per-user ceiling that `ShareReadOnly` applies (`pkg/metadata/auth_identity.go:15`) is enforced later, on every command, from `exp.ReadOnly` via `Handler.authContext`. Setting it in both places would make the handshake refuse an export whose data the client is entitled to read. So `RuntimeExporter` needs the configured `Identity` too: `NewRuntimeExporter(rt *runtime.Runtime, id Identity) *RuntimeExporter`. That is the reason the field exists rather than the exporter reading it off the handler.
+ 
+ **`Handle` is what makes the write path possible, and it must be the volume FILE's handle** — not the share root, not the `volumes` directory. `PrepareWrite`/`CommitWrite` take the file handle and derive the payload ID from it; the share root's handle would resolve to a different payload. Resolve it once here and hold it for the connection's life; that is the whole point of `Export.Handle`.
+ 
+ A missing share, a missing `volumes` directory, or a missing file all map to `ErrUnknownExport` — the export name is client-supplied and the server must not distinguish "no such share" from "no such volume" on the wire.
+ 
++**A disabled share is refused too.** `Resolve` returns `ErrUnknownExport` for a share whose `Enabled` flag is false, and `List` skips such a share rather than advertising a volume that `Resolve` would then refuse. `Share.Enabled` is the DB-row `shares.enabled` flag (`pkg/controlplane/runtime/shares/service.go:26-29`: *"Disabled shares reject new MOUNT / TREE_CONNECT and in-flight operations"*), and `DisableShare` flips it synchronously before a restore begins so that no adapter admits a new client into the restore window. Every other adapter enforces it at establishment — `internal/adapter/nfs/mount/handlers/mount.go:114` (`MountErrAccess`), `internal/adapter/smb/handlers/tree_connect.go:119` (`STATUS_NETWORK_NAME_DELETED`), `internal/adapter/nfs/v4/handlers/helpers.go:226` (`NFS4ERR_STALE`) — and `ServeHandshake`/`Resolve` is the only such point NBD has. The write path that follows does not re-consult the flag, so a client admitted here would keep writing through the restore window. The refusal is reported as an unknown export for the same reason the missing-share case is: the server must not tell a client whether a share exists but is quiesced.
++
++**The fixture must set `Enabled: true`.** `AddShare` copies the flag verbatim from `ShareConfig` (`pkg/controlplane/runtime/shares/lifecycle.go:548`) and nothing defaults it, so a share built without it is disabled and the exporter refuses to resolve it.
++
+ `decision:` resolution happens at handshake only, never on the hot path. The size is fixed at creation, so a re-resolve would only re-read a value that cannot change; holding a file handle across a restart is exactly what §2.2 of the spec avoids.
+ 
+ - [ ] **Step 6: Implement `volume_test.go`'s runtime case**
+ 
+ `TestRuntimeExporter_UnknownShareIsUnknownExport` needs no runtime. Add one case that does, using the existing fixture:
+ 
+ ```go
+ func TestRuntimeExporter_ResolvesVolumeFile(t *testing.T) {
+ 	rt, bsID := testruntime.NewWithShareStore(t)
+ 	store := badgertest.NewInMemory(t)
+ 	if err := rt.RegisterMetadataStore("nbd-meta", store); err != nil {
+ 		t.Fatal(err)
+ 	}
+ 	const share = "/export"
++	// Enabled: true because AddShare copies the flag verbatim and nothing
++	// defaults it; a share built without it is disabled, which the exporter now
++	// refuses to resolve.
+ 	if err := rt.AddShare(context.Background(), &runtime.ShareConfig{
+ 		Name: share, MetadataStore: "nbd-meta", BlockStoreID: bsID,
++		Enabled:           true,
+ 		DefaultPermission: string(models.PermissionReadWrite),
+ 		RootAttr:          &metadata.FileAttr{UID: 1000, GID: 1000},
+ 	}); err != nil {
+ 		t.Fatal(err)
+ 	}
+ 	root, err := rt.GetRootHandle(share)
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+ 	metaSvc := rt.GetMetadataService()
+@@ -915,24 +923,93 @@ func TestRuntimeExporter_ResolvesVolumeFile(t *testing.T) {
+ 	}
+ 	if got.PayloadID == "" {
+ 		t.Fatal("resolved export has an empty payload ID")
+ 	}
+ 	if got.ReadOnly {
+ 		t.Fatal("share is read-write but the export reports read-only")
+ 	}
+ 	if got.Handle == nil {
+ 		t.Fatal("resolved export has no file handle; the write path cannot call PrepareWrite without one")
+ 	}
++	// The handle must be the volume file's own, not the share root's and not
++	// the volumes directory's: PrepareWrite/CommitWrite derive the payload ID
++	// from it, so either of the other two would address different bytes.
++	if !bytes.Equal(got.Handle, createdHandle) {
++		t.Fatalf("export handle = %q, want the volume file's handle %q", got.Handle, createdHandle)
++	}
++}
++
++// TestRuntimeExporter_DisabledShareIsRefusedAndUnlisted pins both halves of the
++// disabled-share gate: the handshake is the only point at which NBD admits a
++// client, so a share being quiesced must be neither resolvable nor advertised.
++func TestRuntimeExporter_DisabledShareIsRefusedAndUnlisted(t *testing.T) {
++	rt, bsID := testruntime.NewWithShareStore(t)
++	store := badgertest.NewInMemory(t)
++	if err := rt.RegisterMetadataStore("nbd-meta", store); err != nil {
++		t.Fatal(err)
++	}
++	const share = "/export"
++	if err := rt.AddShare(context.Background(), &runtime.ShareConfig{
++		Name: share, MetadataStore: "nbd-meta", BlockStoreID: bsID,
++		Enabled:           true,
++		DefaultPermission: string(models.PermissionReadWrite),
++		RootAttr:          &metadata.FileAttr{UID: 1000, GID: 1000},
++	}); err != nil {
++		t.Fatal(err)
++	}
++	root, err := rt.GetRootHandle(share)
++	if err != nil {
++		t.Fatal(err)
++	}
++	metaSvc := rt.GetMetadataService()
++	authCtx := &metadata.AuthContext{
++		Context:  context.Background(),
++		Identity: &metadata.Identity{UID: ptr(uint32(1000)), GID: ptr(uint32(1000))},
++	}
++	vols, _, err := metaSvc.CreateDirectory(authCtx, root, "volumes", &metadata.FileAttr{Mode: 0o755})
++	if err != nil {
++		t.Fatal(err)
++	}
++	volsHandle, err := metadata.EncodeFileHandle(vols)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, _, err := metaSvc.CreateFile(authCtx, volsHandle, "boot", &metadata.FileAttr{Mode: 0o644}); err != nil {
++		t.Fatal(err)
++	}
++
++	ex := NewRuntimeExporter(rt, Identity{UID: 65534, GID: 65534})
++	if _, err := ex.Resolve(context.Background(), "/export/boot"); err != nil {
++		t.Fatalf("Resolve on an enabled share: %v", err)
++	}
++	if names, err := ex.List(context.Background()); err != nil {
++		t.Fatalf("List on an enabled share: %v", err)
++	} else if len(names) != 1 || names[0] != "/export/boot" {
++		t.Fatalf("List on an enabled share = %v, want [/export/boot]", names)
++	}
++
++	if err := rt.SetEnabledForTesting(share, false); err != nil {
++		t.Fatal(err)
++	}
++
++	if _, err := ex.Resolve(context.Background(), "/export/boot"); !errors.Is(err, ErrUnknownExport) {
++		t.Fatalf("Resolve on a disabled share: got %v, want ErrUnknownExport", err)
++	}
++	if names, err := ex.List(context.Background()); err != nil {
++		t.Fatalf("List on a disabled share: %v", err)
++	} else if len(names) != 0 {
++		t.Fatalf("List on a disabled share = %v, want no exports", names)
++	}
+ }
+ ```
+ 
+-Add one test helper in this file: `func ptr[T any](v T) *T { return &v }`.
++Add one test helper in this file: `func ptr[T any](v T) *T { return &v }`. This file's imports must also include `"bytes"` (the `Handle` comparison) and `"errors"` (the `errors.Is` check on the disabled-share refusal).
+ 
+ Convert a `*metadata.File` to a handle with **`metadata.EncodeFileHandle(file)`** (`pkg/metadata/types.go:53`) — the same call `internal/adapter/nfs/v4/handlers/create.go:344` and `lookup.go:105` make, and the reason those adapters never need a handle-minting helper.
+ 
+ **Do not use `store.GenerateHandle` for this.** On Badger it ignores its `path` argument entirely: `pkg/metadata/store/badger/shares.go:21` → `basestore.GenerateHandle(ctx, shareName)` (`pkg/metadata/store/basestore/handle.go:15`) → `metadata.GenerateNewHandle` (`pkg/metadata/types.go:100`), which mints a fresh random UUID. The handle it returns would not name the file you just created, so `SetFileAttributes` would fail with an invalid-handle error and the test would be measuring the wrong thing. `EncodeFileHandle` encodes the file's own ID, which is what `GetFile` resolves against.
+ 
+ Do not hand-build a handle either (`[]byte(share + ":" + someUUID)`): the runtime routes by decoding it, so a fabricated handle would make the test pass and production fail.
+ 
+ Note: `metadata.Service.SetFileAttributes` is at `pkg/metadata/file_modify.go:339` and its size branch requires a regular file and write permission (`:720`, `:740`).
+ 
+ - [ ] **Step 7: Run the tests and confirm they pass**
+diff --git a/internal/adapter/nbd/volume.go b/internal/adapter/nbd/volume.go
+index 37d73f3f..20749e47 100644
+--- a/internal/adapter/nbd/volume.go
++++ b/internal/adapter/nbd/volume.go
+@@ -82,20 +82,32 @@ func (r *RuntimeExporter) Resolve(ctx context.Context, name string) (*Export, er
+ 	volume := name[sep+1:]
+ 
+ 	root, err := r.rt.GetRootHandle(share)
+ 	if err != nil {
+ 		return nil, ErrUnknownExport
+ 	}
+ 	sh, err := r.rt.GetShare(share)
+ 	if err != nil {
+ 		return nil, ErrUnknownExport
+ 	}
++	// A disabled share is being quiesced, and no new client may enter it.
++	//
++	// decision: the gate belongs here because the handshake is the only point
++	// at which NBD admits a client; NFS MOUNT, SMB TREE_CONNECT and the NFSv4
++	// share-entry check each refuse a disabled share when access is
++	// established, and the write path that follows does not re-consult the
++	// flag. The refusal is reported as an unknown export rather than as an
++	// error of its own, because the export name is client-supplied and the
++	// server must not tell a client whether a share exists but is quiesced.
++	if !sh.Enabled {
++		return nil, ErrUnknownExport
++	}
+ 
+ 	// The handshake has no client identity, so the resolution runs as the
+ 	// configured synthetic identity. ShareReadOnly is deliberately not set:
+ 	// this resolves an export the operator already configured, and the
+ 	// per-user read-only ceiling it applies belongs to the commands that
+ 	// follow, not to whether the export may be named at all.
+ 	uid, gid := r.id.UID, r.id.GID
+ 	authCtx := &metadata.AuthContext{
+ 		Context:  ctx,
+ 		Identity: &metadata.Identity{UID: &uid, GID: &gid},
+@@ -151,20 +163,30 @@ func (r *RuntimeExporter) List(ctx context.Context) ([]string, error) {
+ 
+ 	uid, gid := r.id.UID, r.id.GID
+ 	authCtx := &metadata.AuthContext{
+ 		Context:  ctx,
+ 		Identity: &metadata.Identity{UID: &uid, GID: &gid},
+ 	}
+ 	metaSvc := r.rt.GetMetadataService()
+ 
+ 	var names []string
+ 	for _, share := range r.rt.ListShares() {
++		sh, err := r.rt.GetShare(share)
++		if err != nil {
++			return nil, err
++		}
++		// A disabled share is skipped for the same reason Resolve refuses it:
++		// advertising an export the server would then refuse to resolve is a
++		// worse answer than not advertising it.
++		if !sh.Enabled {
++			continue
++		}
+ 		root, err := r.rt.GetRootHandle(share)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+ 		volsDir, err := metaSvc.Lookup(authCtx, root, r.volumesDir)
+ 		if err != nil {
+ 			if metadata.IsNotFoundError(err) {
+ 				continue
+ 			}
+ 			return nil, err
+diff --git a/internal/adapter/nbd/volume_test.go b/internal/adapter/nbd/volume_test.go
+index 9858582f..e6a3283e 100644
+--- a/internal/adapter/nbd/volume_test.go
++++ b/internal/adapter/nbd/volume_test.go
+@@ -1,36 +1,42 @@
+ package nbd
+ 
+ import (
++	"bytes"
+ 	"context"
++	"errors"
+ 	"testing"
+ 
+ 	"github.com/marmos91/dittofs/internal/adapter/testruntime"
+ 	"github.com/marmos91/dittofs/pkg/controlplane/models"
+ 	"github.com/marmos91/dittofs/pkg/controlplane/runtime"
+ 	"github.com/marmos91/dittofs/pkg/metadata"
+ 	"github.com/marmos91/dittofs/pkg/metadata/store/badger/badgertest"
+ )
+ 
+ // ptr returns a pointer to v, for the metadata setters that take one to
+ // distinguish "unset" from a zero value.
+ func ptr[T any](v T) *T { return &v }
+ 
+ func TestRuntimeExporter_ResolvesVolumeFile(t *testing.T) {
+ 	rt, bsID := testruntime.NewWithShareStore(t)
+ 	store := badgertest.NewInMemory(t)
+ 	if err := rt.RegisterMetadataStore("nbd-meta", store); err != nil {
+ 		t.Fatal(err)
+ 	}
+ 	const share = "/export"
++	// Enabled: true because AddShare copies the flag verbatim and nothing
++	// defaults it; a share built without it is disabled, which the exporter now
++	// refuses to resolve.
+ 	if err := rt.AddShare(context.Background(), &runtime.ShareConfig{
+ 		Name: share, MetadataStore: "nbd-meta", BlockStoreID: bsID,
++		Enabled:           true,
+ 		DefaultPermission: string(models.PermissionReadWrite),
+ 		RootAttr:          &metadata.FileAttr{UID: 1000, GID: 1000},
+ 	}); err != nil {
+ 		t.Fatal(err)
+ 	}
+ 	root, err := rt.GetRootHandle(share)
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+ 	metaSvc := rt.GetMetadataService()
+@@ -70,11 +76,80 @@ func TestRuntimeExporter_ResolvesVolumeFile(t *testing.T) {
+ 	}
+ 	if got.PayloadID == "" {
+ 		t.Fatal("resolved export has an empty payload ID")
+ 	}
+ 	if got.ReadOnly {
+ 		t.Fatal("share is read-write but the export reports read-only")
+ 	}
+ 	if got.Handle == nil {
+ 		t.Fatal("resolved export has no file handle; the write path cannot call PrepareWrite without one")
+ 	}
++	// The handle must be the volume file's own, not the share root's and not
++	// the volumes directory's: PrepareWrite/CommitWrite derive the payload ID
++	// from it, so either of the other two would address different bytes.
++	if !bytes.Equal(got.Handle, createdHandle) {
++		t.Fatalf("export handle = %q, want the volume file's handle %q", got.Handle, createdHandle)
++	}
++}
++
++// TestRuntimeExporter_DisabledShareIsRefusedAndUnlisted pins both halves of the
++// disabled-share gate: the handshake is the only point at which NBD admits a
++// client, so a share being quiesced must be neither resolvable nor advertised.
++func TestRuntimeExporter_DisabledShareIsRefusedAndUnlisted(t *testing.T) {
++	rt, bsID := testruntime.NewWithShareStore(t)
++	store := badgertest.NewInMemory(t)
++	if err := rt.RegisterMetadataStore("nbd-meta", store); err != nil {
++		t.Fatal(err)
++	}
++	const share = "/export"
++	if err := rt.AddShare(context.Background(), &runtime.ShareConfig{
++		Name: share, MetadataStore: "nbd-meta", BlockStoreID: bsID,
++		Enabled:           true,
++		DefaultPermission: string(models.PermissionReadWrite),
++		RootAttr:          &metadata.FileAttr{UID: 1000, GID: 1000},
++	}); err != nil {
++		t.Fatal(err)
++	}
++	root, err := rt.GetRootHandle(share)
++	if err != nil {
++		t.Fatal(err)
++	}
++	metaSvc := rt.GetMetadataService()
++	authCtx := &metadata.AuthContext{
++		Context:  context.Background(),
++		Identity: &metadata.Identity{UID: ptr(uint32(1000)), GID: ptr(uint32(1000))},
++	}
++	vols, _, err := metaSvc.CreateDirectory(authCtx, root, "volumes", &metadata.FileAttr{Mode: 0o755})
++	if err != nil {
++		t.Fatal(err)
++	}
++	volsHandle, err := metadata.EncodeFileHandle(vols)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, _, err := metaSvc.CreateFile(authCtx, volsHandle, "boot", &metadata.FileAttr{Mode: 0o644}); err != nil {
++		t.Fatal(err)
++	}
++
++	ex := NewRuntimeExporter(rt, Identity{UID: 65534, GID: 65534})
++	if _, err := ex.Resolve(context.Background(), "/export/boot"); err != nil {
++		t.Fatalf("Resolve on an enabled share: %v", err)
++	}
++	if names, err := ex.List(context.Background()); err != nil {
++		t.Fatalf("List on an enabled share: %v", err)
++	} else if len(names) != 1 || names[0] != "/export/boot" {
++		t.Fatalf("List on an enabled share = %v, want [/export/boot]", names)
++	}
++
++	if err := rt.SetEnabledForTesting(share, false); err != nil {
++		t.Fatal(err)
++	}
++
++	if _, err := ex.Resolve(context.Background(), "/export/boot"); !errors.Is(err, ErrUnknownExport) {
++		t.Fatalf("Resolve on a disabled share: got %v, want ErrUnknownExport", err)
++	}
++	if names, err := ex.List(context.Background()); err != nil {
++		t.Fatalf("List on a disabled share: %v", err)
++	} else if len(names) != 0 {
++		t.Fatalf("List on a disabled share = %v, want no exports", names)
++	}
+ }

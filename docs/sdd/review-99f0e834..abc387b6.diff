@@ -1,0 +1,851 @@
+# Review package: 99f0e834..abc387b6
+
+## Commits
+abc387b6 feat(nbd): adapter lifecycle, control-plane registration, bind gate
+
+## Files changed
+ cmd/dfs/commands/start.go                          |  41 +++++
+ .../plans/2026-10-08-dittofs-nbd-block-protocol.md |  14 +-
+ pkg/adapter/nbd/adapter.go                         | 153 ++++++++++++++++
+ pkg/adapter/nbd/adapter_test.go                    | 202 +++++++++++++++++++++
+ pkg/adapter/nbd/config.go                          | 138 ++++++++++++++
+ pkg/adapter/nbd/healthcheck.go                     |  30 +++
+ pkg/adapter/nbd/healthcheck_test.go                |  34 ++++
+ pkg/controlplane/models/adapter.go                 |   7 +-
+ 8 files changed, 609 insertions(+), 10 deletions(-)
+
+## Diff
+diff --git a/cmd/dfs/commands/start.go b/cmd/dfs/commands/start.go
+index d926ff88..1d7b655d 100644
+--- a/cmd/dfs/commands/start.go
++++ b/cmd/dfs/commands/start.go
+@@ -11,20 +11,21 @@ import (
+ 	"os/signal"
+ 	"slices"
+ 	"strings"
+ 	"syscall"
+ 	"time"
+ 
+ 	"github.com/marmos91/dittofs/internal/auth/netlogon"
+ 	"github.com/marmos91/dittofs/internal/controlplane/api/handlers"
+ 	"github.com/marmos91/dittofs/internal/logger"
+ 	"github.com/marmos91/dittofs/internal/sysinfo"
++	"github.com/marmos91/dittofs/pkg/adapter/nbd"
+ 	"github.com/marmos91/dittofs/pkg/adapter/nfs"
+ 	"github.com/marmos91/dittofs/pkg/adapter/smb"
+ 	"github.com/marmos91/dittofs/pkg/auth/kerberos"
+ 	"github.com/marmos91/dittofs/pkg/block"
+ 	"github.com/marmos91/dittofs/pkg/block/journal"
+ 	"github.com/marmos91/dittofs/pkg/config"
+ 	"github.com/marmos91/dittofs/pkg/controlplane/api"
+ 	"github.com/marmos91/dittofs/pkg/controlplane/models"
+ 	"github.com/marmos91/dittofs/pkg/controlplane/runtime"
+ 	"github.com/marmos91/dittofs/pkg/controlplane/runtime/shares"
+@@ -897,20 +898,22 @@ func kerberosDTOToConfig(dto handlers.KerberosConfigDTO) config.KerberosConfig {
+ // provider joins / loads the persisted secret exactly once regardless of how
+ // many SMB adapter instances the runtime spins up — and injected here. It is
+ // nil when machine_account is disabled.
+ func createAdapterFactory(kerberosConfig *config.KerberosConfig, nlAuth *netlogon.Authenticator) runtime.AdapterFactory {
+ 	return func(cfg *models.AdapterConfig) (runtime.ProtocolAdapter, error) {
+ 		switch cfg.Type {
+ 		case "nfs":
+ 			return createNFSAdapter(cfg, kerberosConfig)
+ 		case "smb":
+ 			return createSMBAdapter(cfg, kerberosConfig, nlAuth)
++		case "nbd":
++			return createNBDAdapter(cfg)
+ 		default:
+ 			return nil, fmt.Errorf("unknown adapter type: %s", cfg.Type)
+ 		}
+ 	}
+ }
+ 
+ func createNFSAdapter(cfg *models.AdapterConfig, kerberosConfig *config.KerberosConfig) (runtime.ProtocolAdapter, error) {
+ 	port := cfg.Port
+ 	if port == 0 {
+ 		port = models.DefaultNFSPort
+@@ -1004,20 +1007,58 @@ func createSMBAdapter(cfg *models.AdapterConfig, kerberosConfig *config.Kerberos
+ 		// the same workstation name the NETLOGON secure channel authenticates as.
+ 		if nlAuth != nil {
+ 			smbAdapter.SetADDomain(kerberosConfig.NetBIOSDomain, kerberosConfig.DNSDomain, netbiosWorkstation(*kerberosConfig))
+ 		}
+ 		smbAdapter.SetNetlogonAuthenticator(nlAuth)
+ 	}
+ 
+ 	return smbAdapter, nil
+ }
+ 
++// createNBDAdapter builds the NBD adapter from its persisted row. The row's
++// port wins over the type default; the adapter-specific settings live in the
++// config blob.
++//
++// allow_remote_bind is the one setting with no safe default: NBD has no
++// authentication, so an adapter that binds a reachable interface without it is
++// refused at Serve. Nothing here can grant it implicitly.
++func createNBDAdapter(cfg *models.AdapterConfig) (runtime.ProtocolAdapter, error) {
++	port := cfg.Port
++	if port == 0 {
++		port = models.DefaultNBDPort
++	}
++
++	nbdCfg := nbd.Config{Enabled: true, Port: port}
++
++	parsedConfig, err := cfg.GetConfig()
++	if err != nil {
++		return nil, fmt.Errorf("failed to parse adapter config: %w", err)
++	}
++
++	if bindAddr, ok := parsedConfig["bind_address"].(string); ok {
++		nbdCfg.BindAddress = bindAddr
++	}
++	if allowRemote, ok := parsedConfig["allow_remote_bind"].(bool); ok {
++		nbdCfg.AllowRemoteBind = allowRemote
++	}
++	if defaultExport, ok := parsedConfig["default_export"].(string); ok {
++		nbdCfg.DefaultExport = defaultExport
++	}
++	if maxConns, ok := parsedConfig["max_connections"].(float64); ok {
++		nbdCfg.MaxConnections = int(maxConns)
++	} else if maxConns, ok := parsedConfig["max_connections"].(int); ok {
++		nbdCfg.MaxConnections = maxConns
++	}
++
++	return nbd.New(nbdCfg), nil
++}
++
+ // handleFormatMismatch prints the operator directive and reports exit 78 when
+ // err describes on-disk state this build cannot read. Returns a non-nil status
+ // when it did, so the caller stops; the caller performs the exit.
+ //
+ // Both store-opening paths must route through here. Metadata stores open in
+ // InitializeFromStore and block stores in LoadSharesFromStore; a mismatch on
+ // either one is the same condition to an operator and deserves the same exit
+ // code and the same directive, not a bare cobra error.
+ //
+ // The status travels back to runStart rather than being exited here: runStart
+diff --git a/docs/superpowers/plans/2026-10-08-dittofs-nbd-block-protocol.md b/docs/superpowers/plans/2026-10-08-dittofs-nbd-block-protocol.md
+index fe2d7c23..9d224f55 100644
+--- a/docs/superpowers/plans/2026-10-08-dittofs-nbd-block-protocol.md
++++ b/docs/superpowers/plans/2026-10-08-dittofs-nbd-block-protocol.md
+@@ -1208,55 +1208,53 @@ func TestStop_IsIdempotent(t *testing.T) {
+ 	if err := a.Stop(ctx); err != nil {
+ 		t.Fatalf("first Stop: %v", err)
+ 	}
+ 	if err := a.Stop(ctx); err != nil {
+ 		t.Fatalf("second Stop: %v", err)
+ 	}
+ }
+ 
+ // The adapter must not treat a per-connection failure as fatal: Serve returning
+ // before cancellation makes DittoServer stop every other adapter.
++//
++// The runtime comes from serveWithRuntime rather than being wired inline:
++// Serve refuses to bind without one, so a listener test cannot skip it. Using
++// the shared helper keeps every listener test on one construction path.
+ func TestServe_ClientDisconnectDoesNotStopTheAdapter(t *testing.T) {
+ 	cfg := minimalConfig()
+ 	cfg.Port = 0
+-	a := nbd.New(cfg)
+-	ctx, cancel := context.WithCancel(context.Background())
+-	defer cancel()
+-	done := make(chan error, 1)
+-	go func() { done <- a.Serve(ctx) }()
++	a, done := serveWithRuntime(t, cfg)
+ 	select {
+ 	case <-a.ListenerReady():
+ 	case <-time.After(5 * time.Second):
+ 		t.Fatal("listener was never ready")
+ 	}
+ 
+ 	// Dial the socket's real address rather than the configured port: this test
+ 	// asks for an ephemeral port, and Port() reports the configured value.
+ 	addr := a.GetListenerAddr()
+ 	for range 3 {
+ 		conn, err := net.Dial("tcp", addr)
+ 		if err != nil {
+ 			t.Fatalf("dial: %v", err)
+ 		}
+ 		// Read the greeting, then hang up mid-handshake.
+ 		buf := make([]byte, 18)
+ 		_, _ = io.ReadFull(conn, buf)
+-		conn.Close()
++		_ = conn.Close()
+ 	}
+ 
+ 	select {
+ 	case err := <-done:
+ 		t.Fatalf("Serve returned after client disconnects: %v", err)
+ 	case <-time.After(300 * time.Millisecond):
+ 	}
+-	cancel()
+-	<-done
+ }
+ 
+ func TestControlPlane_DefaultPortKnowsNBD(t *testing.T) {
+ 	if got := models.DefaultPort("nbd"); got != nbd.DefaultPort {
+ 		t.Fatalf("models.DefaultPort(\"nbd\") = %d, want %d", got, nbd.DefaultPort)
+ 	}
+ 	if err := (&models.AdapterConfig{Type: "nbd", Port: 10809}).Validate(); err != nil {
+ 		t.Fatalf("Validate rejected an nbd adapter: %v", err)
+ 	}
+ }
+diff --git a/pkg/adapter/nbd/adapter.go b/pkg/adapter/nbd/adapter.go
+new file mode 100644
+index 00000000..34cba7e6
+--- /dev/null
++++ b/pkg/adapter/nbd/adapter.go
+@@ -0,0 +1,153 @@
++package nbd
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"io"
++	"net"
++
++	"github.com/marmos91/dittofs/pkg/adapter"
++	"github.com/marmos91/dittofs/pkg/controlplane/runtime"
++	"github.com/marmos91/dittofs/pkg/netutil"
++)
++
++// Adapter serves NBD exports out of a DittoFS share. A guest's kernel NBD
++// client attaches to the adapter's port, names an export of the form
++// <share>/<volume>, and reads and writes that volume's bytes.
++//
++// It embeds [adapter.BaseAdapter] for the TCP lifecycle and adds the two
++// things the base cannot know: the bind gate (NBD is unauthenticated, so a
++// remotely reachable export is an explicit opt-in) and the configuration the
++// wire layer is built from.
++type Adapter struct {
++	*adapter.BaseAdapter
++
++	// config is the resolved configuration. New applies the defaults before
++	// storing it, so every read here sees a complete config.
++	config Config
++
++	// runtime is the control-plane runtime that resolves export names to
++	// shares. Set by SetRuntime before Serve, which refuses to start without
++	// it.
++	runtime *runtime.Runtime
++}
++
++// New returns an adapter for config with the defaults applied.
++//
++// It panics on an invalid configuration, matching the other adapters: the
++// values come from the operator's config file and the control-plane row, and
++// models.AdapterConfig.Validate rejects the same ranges before an adapter is
++// built, so an invalid value reaching this constructor is a programming error
++// rather than something a client can provoke.
++func New(config Config) *Adapter {
++	config.applyDefaults()
++	if err := config.validate(); err != nil {
++		panic(fmt.Sprintf("invalid NBD config: %v", err))
++	}
++
++	base := adapter.NewBaseAdapter(adapter.BaseConfig{
++		BindAddress:     config.BindAddress,
++		Port:            config.Port,
++		MaxConnections:  config.MaxConnections,
++		ShutdownTimeout: config.Timeouts.Shutdown,
++	}, "nbd")
++
++	return &Adapter{BaseAdapter: base, config: config}
++}
++
++// SetRuntime stores the control-plane runtime. It panics on any other type,
++// matching [adapter.BaseAdapter.SetRuntime]'s documented contract.
++//
++// decision: the export resolver and the wire handler are built in Serve, not
++// here. They are built from the runtime and the configuration together, and
++// building them in Serve is what makes a bad configuration or a missing
++// runtime a startup error rather than a failure on the first connection.
++func (a *Adapter) SetRuntime(rt any) {
++	r, ok := rt.(*runtime.Runtime)
++	if !ok {
++		panic(fmt.Sprintf("nbd: SetRuntime wants *runtime.Runtime, got %T", rt))
++	}
++	// The base adapter keeps its own reference for the shared accept loop,
++	// which reaches it for connection metrics.
++	a.BaseAdapter.SetRuntime(rt)
++	a.runtime = r
++}
++
++// Serve binds the configured address and serves NBD connections until ctx is
++// cancelled.
++//
++// decision: the remote-bind gate runs first — before the listener exists and
++// before the runtime is consulted — so a refused bind opens no socket and
++// reports the one setting the operator has to change. The order is part of the
++// contract, not an accident of how the function was written: a runtime check
++// that ran first would report a missing runtime for a bind that is going to be
++// refused anyway.
++func (a *Adapter) Serve(ctx context.Context) error {
++	// An empty BindAddress is a non-loopback bind: it listens on every
++	// interface. netutil.IsNonLoopbackHost reports true for it because the
++	// value is not an IP literal, so it falls through to the branch that
++	// assumes a non-IP host resolves off-host. That is the behaviour this gate
++	// wants, so it needs no special case.
++	if netutil.IsNonLoopbackHost(a.config.BindAddress) && !a.config.AllowRemoteBind {
++		return fmt.Errorf("nbd: refusing to bind %q without allow_remote_bind: "+
++			"NBD has no authentication and no per-path scoping, so a remotely "+
++			"reachable export hands every byte of the volume to anyone who can "+
++			"reach the port", a.config.BindAddress)
++	}
++
++	if a.runtime == nil {
++		return errors.New("nbd: SetRuntime was not called before Serve")
++	}
++
++	return a.ServeWithFactory(ctx, a, nil, nil)
++}
++
++// Stop initiates graceful shutdown and waits for in-flight connections to
++// drain. It is safe to call more than once: the base adapter's shutdown is
++// guarded by a sync.Once, so a repeat call only waits for the drain the first
++// one started.
++func (a *Adapter) Stop(ctx context.Context) error {
++	return a.BaseAdapter.Stop(ctx)
++}
++
++// NewConnection returns the handler for one accepted TCP connection. It
++// implements [adapter.ConnectionFactory].
++func (a *Adapter) NewConnection(conn net.Conn) adapter.ConnectionHandler {
++	return &nbdConn{conn: conn}
++}
++
++// nbdGreeting is the 18-byte server greeting: the NBDMAGIC and IHAVEOPT magics
++// followed by the handshake flag word (fixed-newstyle | no-zeroes).
++//
++// The wire layer writes the same bytes in its own writeGreeting, which is
++// unexported; a placeholder is not a reason to widen that package's API, so
++// the bytes are restated here and go away with the placeholder.
++var nbdGreeting = []byte{
++	'N', 'B', 'D', 'M', 'A', 'G', 'I', 'C',
++	'I', 'H', 'A', 'V', 'E', 'O', 'P', 'T',
++	0x00, 0x03,
++}
++
++// nbdConn is a placeholder connection handler: it greets the client, drains
++// whatever the client sends, and closes. It serves no commands.
++//
++// decision: this exists only so the adapter lifecycle is exercisable end to
++// end before the wire layer is wired in — the accept path, the per-connection
++// goroutine, and the shutdown drain are all shared with the real handler, and
++// the real handler replaces this type without changing any of them.
++type nbdConn struct {
++	conn net.Conn
++}
++
++// Serve greets the client and then waits for it to hang up. The base adapter
++// interrupts the blocking read on shutdown, so the drain does not outlive the
++// adapter.
++func (c *nbdConn) Serve(_ context.Context) {
++	defer func() { _ = c.conn.Close() }()
++
++	if _, err := c.conn.Write(nbdGreeting); err != nil {
++		return
++	}
++	_, _ = io.Copy(io.Discard, c.conn)
++}
+diff --git a/pkg/adapter/nbd/adapter_test.go b/pkg/adapter/nbd/adapter_test.go
+new file mode 100644
+index 00000000..fa4e1c9a
+--- /dev/null
++++ b/pkg/adapter/nbd/adapter_test.go
+@@ -0,0 +1,202 @@
++package nbd_test
++
++import (
++	"context"
++	"io"
++	"net"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/marmos91/dittofs/internal/adapter/testruntime"
++	"github.com/marmos91/dittofs/pkg/adapter/nbd"
++	"github.com/marmos91/dittofs/pkg/controlplane/models"
++)
++
++func minimalConfig() nbd.Config {
++	return nbd.Config{Enabled: true, Port: 11089, BindAddress: "127.0.0.1"}
++}
++
++func TestNew_AppliesDefaults(t *testing.T) {
++	a := nbd.New(nbd.Config{})
++	if a.Port() != nbd.DefaultPort {
++		t.Fatalf("Port() = %d, want %d", a.Port(), nbd.DefaultPort)
++	}
++	if a.Protocol() != "nbd" {
++		t.Fatalf("Protocol() = %q, want %q", a.Protocol(), "nbd")
++	}
++}
++
++func TestNew_PanicsOnOutOfRangePort(t *testing.T) {
++	defer func() {
++		if recover() == nil {
++			t.Fatal("New with port 70000 did not panic; the adapter constructor contract is to panic on programmer error")
++		}
++	}()
++	nbd.New(nbd.Config{Enabled: true, Port: 70000})
++}
++
++// The bind gate. An NBD export is unauthenticated by construction: there is no
++// AUTH_SYS, no Kerberos, and a single READ hands over every byte with no path
++// scoping. A non-loopback bind must therefore be an explicit opt-in.
++//
++// The empty string is in the list deliberately: IsNonLoopbackHost("") is true
++// (net.ParseIP("") is nil and the final branch assumes a hostname resolves
++// off-host), which is the behaviour the gate wants — an empty BindAddress binds
++// every interface. Do not add a special case for it.
++func TestServe_RefusesNonLoopbackBindWithoutOptIn(t *testing.T) {
++	for _, bind := range []string{"", "0.0.0.0", "::", "192.168.1.10"} {
++		t.Run(bind, func(t *testing.T) {
++			cfg := minimalConfig()
++			cfg.BindAddress = bind
++			a := nbd.New(cfg)
++			err := a.Serve(context.Background())
++			if err == nil {
++				t.Fatal("Serve on a non-loopback address without AllowRemoteBind returned nil")
++			}
++			if !strings.Contains(err.Error(), "allow_remote_bind") {
++				t.Fatalf("error %q does not name allow_remote_bind, so an operator cannot find the setting", err)
++			}
++		})
++	}
++}
++
++// The gate runs before the listener is created and before the runtime is
++// consulted, so this test needs neither a free port nor a fixture.
++func TestServe_RefusesRemoteBindEvenWithNoRuntime(t *testing.T) {
++	cfg := minimalConfig()
++	cfg.BindAddress = "0.0.0.0"
++	a := nbd.New(cfg)
++	if err := a.Serve(context.Background()); err == nil {
++		t.Fatal("the bind gate must refuse before Serve touches the runtime")
++	} else if strings.Contains(err.Error(), "SetRuntime") {
++		t.Fatalf("the runtime check ran before the bind gate: %v", err)
++	}
++}
++
++// Serve needs a runtime once it gets past the gate, so the listener tests use
++// the real fixture. This also exercises SetRuntime, which nothing else does.
++func serveWithRuntime(t *testing.T, cfg nbd.Config) (*nbd.Adapter, chan error) {
++	t.Helper()
++	rt, _ := testruntime.NewWithShareStore(t)
++	a := nbd.New(cfg)
++	a.SetRuntime(rt)
++	ctx, cancel := context.WithCancel(context.Background())
++	done := make(chan error, 1)
++	go func() { done <- a.Serve(ctx) }()
++	t.Cleanup(func() {
++		cancel()
++		select {
++		case <-done:
++		case <-time.After(5 * time.Second):
++			t.Error("Serve did not return after context cancellation")
++		}
++	})
++	return a, done
++}
++
++func TestServe_AllowsLoopbackBind(t *testing.T) {
++	// "::1" is deliberately absent and "[::1]" stands in for it. BaseAdapter
++	// builds its listen address as fmt.Sprintf("%s:%d", BindAddress, Port)
++	// (pkg/adapter/base.go:216), so a BARE IPv6 literal yields "::1:0" and
++	// net.Listen rejects it with "too many colons in address"; the bracketed
++	// form is what binds. That is a property of the shared base adapter, not
++	// something this task changes, so the test does not assert a capability the
++	// code lacks. Both spellings pass netutil.IsNonLoopbackHost as loopback, so
++	// the gate admits either — only the listen address differs.
++	for _, bind := range []string{"127.0.0.1", "[::1]", "localhost"} {
++		t.Run(bind, func(t *testing.T) {
++			cfg := minimalConfig()
++			cfg.BindAddress = bind
++			cfg.Port = 0 // ephemeral: the test must not need a fixed free port
++			a, done := serveWithRuntime(t, cfg)
++			select {
++			case <-a.ListenerReady():
++			case err := <-done:
++				t.Fatalf("Serve returned before the listener was ready: %v", err)
++			case <-time.After(5 * time.Second):
++				t.Fatal("listener was never ready")
++			}
++			// GetListenerAddr, not Port. Port() returns the CONFIGURED port
++			// (pkg/adapter/base.go:598 is "return b.Config.Port") and nothing ever
++			// writes the bound port back into Config, so Port() is legitimately 0
++			// whenever the test asked for an ephemeral one. GetListenerAddr reports
++			// the socket's real address, and it blocks on listenerReady too.
++			if a.GetListenerAddr() == "" {
++				t.Fatal("GetListenerAddr is empty after ListenerReady; the adapter did not bind a listener")
++			}
++		})
++	}
++}
++
++func TestServe_AllowsNonLoopbackWithOptIn(t *testing.T) {
++	cfg := minimalConfig()
++	cfg.BindAddress = "0.0.0.0"
++	cfg.AllowRemoteBind = true
++	cfg.Port = 0
++	a, done := serveWithRuntime(t, cfg)
++	select {
++	case <-a.ListenerReady():
++	case err := <-done:
++		t.Fatalf("Serve with AllowRemoteBind returned early: %v", err)
++	case <-time.After(5 * time.Second):
++		t.Fatal("listener was never ready")
++	}
++}
++
++func TestStop_IsIdempotent(t *testing.T) {
++	a := nbd.New(minimalConfig())
++	ctx := context.Background()
++	if err := a.Stop(ctx); err != nil {
++		t.Fatalf("first Stop: %v", err)
++	}
++	if err := a.Stop(ctx); err != nil {
++		t.Fatalf("second Stop: %v", err)
++	}
++}
++
++// The adapter must not treat a per-connection failure as fatal: Serve returning
++// before cancellation makes DittoServer stop every other adapter.
++//
++// The runtime comes from serveWithRuntime rather than being wired inline:
++// Serve refuses to bind without one, so a listener test cannot skip it. Using
++// the shared helper keeps every listener test on one construction path.
++func TestServe_ClientDisconnectDoesNotStopTheAdapter(t *testing.T) {
++	cfg := minimalConfig()
++	cfg.Port = 0
++	a, done := serveWithRuntime(t, cfg)
++	select {
++	case <-a.ListenerReady():
++	case <-time.After(5 * time.Second):
++		t.Fatal("listener was never ready")
++	}
++
++	// Dial the socket's real address rather than the configured port: this test
++	// asks for an ephemeral port, and Port() reports the configured value.
++	addr := a.GetListenerAddr()
++	for range 3 {
++		conn, err := net.Dial("tcp", addr)
++		if err != nil {
++			t.Fatalf("dial: %v", err)
++		}
++		// Read the greeting, then hang up mid-handshake.
++		buf := make([]byte, 18)
++		_, _ = io.ReadFull(conn, buf)
++		_ = conn.Close()
++	}
++
++	select {
++	case err := <-done:
++		t.Fatalf("Serve returned after client disconnects: %v", err)
++	case <-time.After(300 * time.Millisecond):
++	}
++}
++
++func TestControlPlane_DefaultPortKnowsNBD(t *testing.T) {
++	if got := models.DefaultPort("nbd"); got != nbd.DefaultPort {
++		t.Fatalf("models.DefaultPort(\"nbd\") = %d, want %d", got, nbd.DefaultPort)
++	}
++	if err := (&models.AdapterConfig{Type: "nbd", Port: 10809}).Validate(); err != nil {
++		t.Fatalf("Validate rejected an nbd adapter: %v", err)
++	}
++}
+diff --git a/pkg/adapter/nbd/config.go b/pkg/adapter/nbd/config.go
+new file mode 100644
+index 00000000..fec203d3
+--- /dev/null
++++ b/pkg/adapter/nbd/config.go
+@@ -0,0 +1,138 @@
++package nbd
++
++import (
++	"fmt"
++	"time"
++)
++
++// DefaultPort is the port the NBD adapter binds when none is configured. It is
++// the port the kernel NBD client's documentation uses for a userspace server;
++// the protocol itself has no assigned port.
++const DefaultPort = 10809
++
++// DefaultMaxMessageSize is the default cap on a single NBD request payload.
++// The wire layer's maximum block size is 32 MiB (the largest the adapter
++// advertises in its block-size information reply), so anything larger than
++// that is a client that ignored the advertisement.
++const DefaultMaxMessageSize = 32 << 20
++
++// DefaultUID and DefaultGID are the unprivileged identity the adapter runs
++// metadata operations as when the operator configures none: nobody/nogroup.
++// NBD carries no user identity at all, so every operation runs as this one
++// synthetic identity, and UID 0 would hand every client root on the volume.
++const (
++	DefaultUID = uint32(65534)
++	DefaultGID = uint32(65534)
++)
++
++// TimeoutsConfig groups the operator-facing timers for an NBD connection.
++type TimeoutsConfig struct {
++	// Read is the maximum duration for reading a complete request from a
++	// client. It bounds a client that has completed its handshake but then
++	// stalls mid-request.
++	Read time.Duration `mapstructure:"read"`
++
++	// Write is the maximum duration for writing a reply to a client. It
++	// bounds a client that stops reading.
++	Write time.Duration `mapstructure:"write"`
++
++	// Idle is the maximum duration a connection may remain idle between
++	// requests before the adapter closes it. 0 means no idle timeout.
++	Idle time.Duration `mapstructure:"idle"`
++
++	// Shutdown is the maximum duration to wait for in-flight connections to
++	// finish during graceful shutdown. It is handed to the base adapter, which
++	// owns the drain deadline.
++	Shutdown time.Duration `mapstructure:"shutdown"`
++}
++
++// Config holds the operator-facing configuration for the NBD adapter.
++//
++// Default values (applied by New when zero):
++//   - Port: 10809
++//   - Timeouts.Read: 5m
++//   - Timeouts.Write: 30s
++//   - Timeouts.Idle: 5m
++//   - Timeouts.Shutdown: 30s
++//   - MaxMessageSize: 32 MiB
++//   - UID/GID: 65534 (nobody/nogroup)
++type Config struct {
++	// Enabled controls whether the adapter is active. When false the adapter
++	// is not started and reports StatusDisabled.
++	Enabled bool `mapstructure:"enabled"`
++
++	// Port is the TCP port to listen on. 0 means the default (10809).
++	Port int `mapstructure:"port"`
++
++	// BindAddress is the interface to bind. An empty string or "0.0.0.0"
++	// binds every interface, which for an unauthenticated protocol requires
++	// AllowRemoteBind.
++	BindAddress string `mapstructure:"bind_address"`
++
++	// MaxConnections limits concurrent client connections. 0 means unlimited.
++	MaxConnections int `mapstructure:"max_connections"`
++
++	// MaxMessageSize caps a single request payload in bytes. 0 means the
++	// default (32 MiB).
++	MaxMessageSize int `mapstructure:"max_message_size"`
++
++	// Timeouts groups the connection timers.
++	Timeouts TimeoutsConfig `mapstructure:"timeouts"`
++
++	// AllowRemoteBind permits binding an interface reachable off-host. NBD has
++	// no authentication and no per-path scoping — a single READ returns every
++	// byte of the volume — so a remote bind is off by default and an operator
++	// must opt in explicitly.
++	AllowRemoteBind bool `mapstructure:"allow_remote_bind"`
++
++	// DefaultExport is the export name offered to a client that requests none.
++	// An export name is of the form <share>/<volume>.
++	DefaultExport string `mapstructure:"default_export"`
++
++	// UID is the Unix UID every metadata operation runs as. NBD carries no
++	// client identity, so this is the sole principal.
++	UID uint32 `mapstructure:"uid"`
++
++	// GID is the Unix GID every metadata operation runs as.
++	GID uint32 `mapstructure:"gid"`
++}
++
++// applyDefaults fills zero values with the adapter's defaults.
++func (c *Config) applyDefaults() {
++	if c.Port <= 0 {
++		c.Port = DefaultPort
++	}
++	if c.Timeouts.Read == 0 {
++		c.Timeouts.Read = 5 * time.Minute
++	}
++	if c.Timeouts.Write == 0 {
++		c.Timeouts.Write = 30 * time.Second
++	}
++	if c.Timeouts.Idle == 0 {
++		c.Timeouts.Idle = 5 * time.Minute
++	}
++	if c.Timeouts.Shutdown == 0 {
++		c.Timeouts.Shutdown = 30 * time.Second
++	}
++	if c.MaxMessageSize == 0 {
++		c.MaxMessageSize = DefaultMaxMessageSize
++	}
++	if c.UID == 0 {
++		c.UID = DefaultUID
++	}
++	if c.GID == 0 {
++		c.GID = DefaultGID
++	}
++}
++
++// validate reports whether the configuration describes an adapter that can be
++// built. It runs after applyDefaults, so a zero port here is one the operator
++// asked for explicitly rather than an omitted field.
++func (c *Config) validate() error {
++	// Port 0 is valid: it asks the OS for an ephemeral port, which is what the
++	// lifecycle tests use.
++	if c.Port < 0 || c.Port > 65535 {
++		return fmt.Errorf("invalid port %d: must be 0-65535", c.Port)
++	}
++	return nil
++}
+diff --git a/pkg/adapter/nbd/healthcheck.go b/pkg/adapter/nbd/healthcheck.go
+new file mode 100644
+index 00000000..e7b5ee20
+--- /dev/null
++++ b/pkg/adapter/nbd/healthcheck.go
+@@ -0,0 +1,30 @@
++package nbd
++
++import (
++	"context"
++	"time"
++
++	"github.com/marmos91/dittofs/pkg/health"
++)
++
++// Healthcheck reports the adapter's health.
++//
++//   - A disabled adapter reports [health.StatusDisabled]: it was turned off
++//     deliberately, so there is nothing to probe.
++//   - Otherwise the base adapter's derivation applies: unknown before the
++//     listener is bound, unhealthy once shutdown has been initiated and Serve
++//     has not yet returned, healthy while running.
++//
++// No error instrumentation is tracked yet, so a running NBD adapter always
++// reports healthy; there is nothing that can degrade until export resolution
++// starts counting its failures.
++func (a *Adapter) Healthcheck(ctx context.Context) health.Report {
++	if !a.config.Enabled {
++		return health.Report{
++			Status:    health.StatusDisabled,
++			Message:   "NBD adapter is disabled in config",
++			CheckedAt: time.Now().UTC(),
++		}
++	}
++	return a.BaseAdapter.Healthcheck(ctx)
++}
+diff --git a/pkg/adapter/nbd/healthcheck_test.go b/pkg/adapter/nbd/healthcheck_test.go
+new file mode 100644
+index 00000000..e8457709
+--- /dev/null
++++ b/pkg/adapter/nbd/healthcheck_test.go
+@@ -0,0 +1,34 @@
++package nbd_test
++
++import (
++	"context"
++	"testing"
++
++	"github.com/marmos91/dittofs/pkg/adapter/nbd"
++	"github.com/marmos91/dittofs/pkg/health"
++)
++
++func TestNBDAdapter_Healthcheck_DisabledWhenConfigOff(t *testing.T) {
++	cfg := minimalConfig()
++	cfg.Enabled = false
++	a := nbd.New(cfg)
++
++	rep := a.Healthcheck(context.Background())
++	if rep.Status != health.StatusDisabled {
++		t.Fatalf("disabled config: got %q (%q), want disabled", rep.Status, rep.Message)
++	}
++	if rep.Message == "" {
++		t.Fatal("expected non-empty message describing the disabled state")
++	}
++}
++
++func TestNBDAdapter_Healthcheck_UnknownBeforeStart(t *testing.T) {
++	a := nbd.New(minimalConfig())
++
++	rep := a.Healthcheck(context.Background())
++	// The base adapter has not been started, so the override delegates and
++	// returns unknown.
++	if rep.Status != health.StatusUnknown {
++		t.Fatalf("enabled but not started: got %q (%q), want unknown", rep.Status, rep.Message)
++	}
++}
+diff --git a/pkg/controlplane/models/adapter.go b/pkg/controlplane/models/adapter.go
+index 84c2ae26..9ceaa6a0 100644
+--- a/pkg/controlplane/models/adapter.go
++++ b/pkg/controlplane/models/adapter.go
+@@ -2,63 +2,66 @@ package models
+ 
+ import (
+ 	"encoding/json"
+ 	"fmt"
+ 	"time"
+ )
+ 
+ // AdapterConfig defines a protocol adapter configuration.
+ type AdapterConfig struct {
+ 	ID        string    `gorm:"primaryKey;size:36" json:"id"`
+-	Type      string    `gorm:"uniqueIndex;not null;size:50" json:"type"` // nfs, smb
++	Type      string    `gorm:"uniqueIndex;not null;size:50" json:"type"` // nfs, smb, nbd
+ 	Enabled   bool      `gorm:"default:true" json:"enabled"`
+ 	Port      int       `gorm:"default:0" json:"port"`
+ 	Config    string    `gorm:"type:text" json:"-"` // JSON blob for adapter-specific config
+ 	CreatedAt time.Time `gorm:"autoCreateTime" json:"created_at"`
+ 	UpdatedAt time.Time `gorm:"autoUpdateTime" json:"updated_at"`
+ 
+ 	// Parsed configuration (not stored in DB)
+ 	ParsedConfig map[string]any `gorm:"-" json:"config,omitempty"`
+ }
+ 
+ // Default ports an adapter binds to when its configured port is 0. The adapter
+ // factory and the unchanged-listener check both resolve a zero port through
+ // these, so a reload compares resolved-against-resolved rather than a sentinel
+ // against a concrete port — keeping this the single source of truth.
+ const (
+ 	DefaultNFSPort = 12049
+ 	DefaultSMBPort = 12445
++	DefaultNBDPort = 10809
+ )
+ 
+ // DefaultPort returns the port an adapter of the given type binds to when its
+ // configured port is 0, or 0 when the type has no known default.
+ func DefaultPort(adapterType string) int {
+ 	switch adapterType {
+ 	case "nfs":
+ 		return DefaultNFSPort
+ 	case "smb":
+ 		return DefaultSMBPort
++	case "nbd":
++		return DefaultNBDPort
+ 	default:
+ 		return 0
+ 	}
+ }
+ 
+ // Validate reports whether the configuration describes an adapter the server
+ // can actually build: the adapter constructors treat an out-of-range port as a
+ // programmer error and panic on it, and the type decides which constructor runs
+ // at all, so both have to be refused before a row is persisted or a start is
+ // attempted.
+ func (a *AdapterConfig) Validate() error {
+ 	// Only the types with a known default port have a constructor in the
+ 	// adapter factory, so a type without one has no adapter to build.
+ 	if DefaultPort(a.Type) == 0 {
+-		return fmt.Errorf("unsupported adapter type %q: must be one of nfs, smb", a.Type)
++		return fmt.Errorf("unsupported adapter type %q: must be one of nfs, smb, nbd", a.Type)
+ 	}
+ 	if a.Port < 0 || a.Port > 65535 {
+ 		return fmt.Errorf("invalid port %d: must be 0-65535", a.Port)
+ 	}
+ 	return nil
+ }
+ 
+ // TableName returns the table name for AdapterConfig.
+ func (AdapterConfig) TableName() string {
+ 	return "adapters"

@@ -1,0 +1,207 @@
+# Review package: 7473656d..ac29d710
+
+## Commits
+ac29d710 test(nbd): bound the payload read and the punch failure arm
+52138d7d docs(nbd): pin the payload read arm, which nothing tested
+
+## Files changed
+ .../plans/2026-10-08-dittofs-nbd-block-protocol.md | 25 ++++++++++
+ internal/adapter/nbd/connection_test.go            | 57 +++++++++++++++++++++-
+ 2 files changed, 81 insertions(+), 1 deletion(-)
+
+## Diff
+diff --git a/docs/superpowers/plans/2026-10-08-dittofs-nbd-block-protocol.md b/docs/superpowers/plans/2026-10-08-dittofs-nbd-block-protocol.md
+index c1ee4786..669d8630 100644
+--- a/docs/superpowers/plans/2026-10-08-dittofs-nbd-block-protocol.md
++++ b/docs/superpowers/plans/2026-10-08-dittofs-nbd-block-protocol.md
+@@ -2442,20 +2442,44 @@ The test that pins it must use `Idle` **shorter** than `Read`, or it passes eith
+ ```go
+ func TestConnection_IdleDeadlineClosesASilentConnection(t *testing.T) {
+ 	// Timeouts{Read: 5 * time.Second, Idle: 200 * time.Millisecond}: complete
+ 	// the handshake, then send nothing. serve must return within ~1s. With
+ 	// Idle == Read or Idle > Read this passes whether or not the arm exists --
+ 	// which is why the committed TestConnection_PartialHeaderTimesOut
+ 	// (connection_test.go:696, Idle 5s / Read 200ms) cannot catch it.
+ }
+ ```
+ 
++**The second arm needs its own test, and the block above does not cover it.**
++`TestConnection_IdleDeadlineClosesASilentConnection` pins the *header* wait; the
++payload wait is a different arm in a different function, and nothing pins it.
++Measured: deleting `conn.SetReadDeadline(time.Now().Add(h.timeouts.Read))` from
++`handleWrite` (the arm before `io.ReadFull`) leaves **the whole package green** —
++`go test ./internal/adapter/nbd/ -count=1` → `ok ... 4.725s`. The committed
++`TestConnection_WriteTruncatedPayloadIsAnError` does not catch it because it uses
++`testTimeouts()` (`Read 5s / Idle 5s`, so the two budgets are equal) **and closes
++the client**, so the read returns on EOF and no deadline is ever consulted. Add:
++
++```go
++func TestConnection_PayloadReadIsBoundedByRead(t *testing.T) {
++	// Timeouts{Read: 200 * time.Millisecond, Idle: 5 * time.Second} -- the
++	// inverse of the header test, because this one must be bounded by Read.
++	// Complete the handshake, send a WRITE header declaring 4096 bytes, send
++	// 100 bytes of payload, then go silent WITHOUT closing: only the deadline
++	// can end this, and it must be Read's. Assert serve returns non-nil within
++	// ~1s and that st.writes == 0.
++	//
++	// With the arm removed the payload read inherits the header's Idle budget
++	// (5s), so serve is still running at 1s and the test fails.
++}
++```
++
+ Leave the arm inside `if !h.draining()`, which is already correct: `initiateShutdown` sets a 100 ms deadline on every active connection (`pkg/adapter/base.go:447`) and a fresh `SetReadDeadline` replaces it, so arming the full budget while draining would hold the drain open for it.
+ 
+ - [ ] **Step 6: Run the tests and confirm they pass**
+ 
+ Run: `go test ./internal/adapter/nbd/ -race -v`
+ Expected: PASS.
+ 
+ - [ ] **Step 7: Add the integration assertions**
+ 
+ ```go
+@@ -2839,20 +2863,21 @@ Run in order; each becomes meaningful at the task named.
+ - [ ] Task 4 — `TestConn_PanicInHandlerDoesNotKillTheProcess` passes, and fails (by crashing the test binary, not by an assertion) when the `recover` is removed from `Conn.Serve`.
+ - [ ] Task 4 — `TestConnection_FailedStoreResolutionDegradesAndCounts` passes, and `h.TakeDegraded()` returns 0 on the second call.
+ - [ ] Task 4 — the `handler` field is an `atomic.Pointer`, and `go test -race` reports no race between `Serve` and `Healthcheck` (drive a probe while a connection is being accepted).
+ - [ ] Task 5 — `TestConnection_WriteZeroLengthIsEINVAL` passes and the connection is still usable afterwards.
+ - [ ] Task 5 — `TestConnection_RejectedWriteKeepsTheStreamSynchronized` passes, and fails when the payload drain is removed.
+ - [ ] Task 5 — `TestConnection_WriteWithFUAIsDurableBeforeReply` passes, and fails when `commit` is moved after the reply.
+ - [ ] Task 5 — a WRITE refused by POSIX mode bits reaches the client as `ErrEPERM`, not `ErrEIO`. The metadata funnel returns `merrs.ErrAccessDenied` (`pkg/metadata/auth_permissions.go:510`, `:539`), a different code from `ErrPermissionDenied`; the test needs a real metadata service with the volume created as one identity and written as another, or it passes vacuously.
+ - [ ] Task 5 — `TestIntegration_FlushRequireDurableWithUnhealthyRemoteIsEIO` passes.
+ - [ ] Task 6 — `TestConnection_WriteZeroesThenReadIsZeros` asserts `st.punches == 1` and `st.writes == 0`, and fails when `WriteZeroes` is changed to a zero-buffer write.
+ - [ ] Task 6 — `TestConnection_IdleDeadlineClosesASilentConnection` fails when the `Idle` arm is removed, and only when `Idle` is shorter than `Read` (`Idle: 200ms` vs `Read: 5s`). Measured without the arm: `serve still running after 1.5s`.
++- [ ] Task 6 — `TestConnection_PayloadReadIsBoundedByRead` fails when the payload arm is removed from `handleWrite` (`Read: 200ms` vs `Idle: 5s`, the inverse fixture). Measured: without it the payload read inherits the 5s header budget and **the whole package still passes**, because `TestConnection_WriteTruncatedPayloadIsAnError` uses equal budgets and closes the client, so EOF ends the read before any deadline is consulted.
+ - [ ] Task 6 — `TestIntegration_TrimFreesAndReadsZero` and `TestIntegration_WriteZeroesDoesNotMaterializeChunks` assert the manifest shrank (`file.Blocks` before/after, read through `GetFile`), not that `DataExtents` shrank. The extent-map assertion is unsatisfiable: `engine.PunchHole` zero-overwrites through the local append log, so the local tier keeps reporting the range, and `DataExtents` over-reports by documented contract.
+ - [ ] Task 6 — `TestConnection_WriteZeroesWithNoHoleIsAccepted` passes (`NO_HOLE` is a MUST we advertise) and `TestConnection_WriteWithNoHoleFlagIsEINVAL` passes (it is not a `WRITE` flag).
+ - [ ] Task 6 — `TestConnection_TrimZeroLengthIsEINVAL` and `TestConnection_WriteZeroesZeroLengthIsEINVAL` pin the uniform zero-length answer (`EINVAL`), and each is followed by a valid command on the same connection to prove the stream is still usable.
+ - [ ] Task 6 — `TestConnection_TrimPastEndIsEINVAL`, `TestConnection_TrimOffsetPastEndIsEINVAL`, and `TestConnection_WriteZeroesPastEndIsENOSPC` pin out-of-range refusal (not clamping), and `TestConnection_TrimIsEPERMOnReadOnlyExport` passes with `SEND_TRIM` still advertised.
+ - [ ] Task 6 — `go build ./... && go test -race ./internal/adapter/nbd/... ./pkg/adapter/nbd/... ./internal/adapter/common/...` clean (NOT `make test-unit`, which times out on five unrelated packages on this machine).
+ - [ ] Task 7 — `test/nbd/run-oracle.sh` exits 0 with identical transcripts against `qemu-nbd`, and the script passes `--discard=unmap` (without it the discard step diverges on the oracle's configuration, not on the codec).
+ - [ ] Task 7 — the flag-parity check confirms every flag DittoFS advertises is one `qemu-nbd` also advertises.
+ - [ ] Task 7 — `internal/adapter/nbd/oracle_test.go` skips (not fails) without QEMU, and `run-oracle.sh` treats that skip as a failure; the script prints which tier ran, so a green run says what it checked.
+ - [ ] Task 8 — the launch line carries **no `hostfwd`**: it forwards host→guest, which is the wrong direction and would try to bind host port 10809 where DittoFS is listening. The guest reaches the host at `10.0.2.2` with no rule.
+ - [ ] Task 8 — `bash -n` clean on both scripts; each refuses cleanly without prerequisites.
+diff --git a/internal/adapter/nbd/connection_test.go b/internal/adapter/nbd/connection_test.go
+index 5203980c..5ce7ae95 100644
+--- a/internal/adapter/nbd/connection_test.go
++++ b/internal/adapter/nbd/connection_test.go
+@@ -729,21 +729,21 @@ func TestConnection_PartialHeaderTimesOut(t *testing.T) {
+ 	if _, err := client.Write([]byte{0x25, 0x60, 0x95, 0x13}); err != nil {
+ 		t.Fatalf("write partial header: %v", err)
+ 	}
+ 
+ 	select {
+ 	case err := <-done:
+ 		if err == nil {
+ 			t.Fatal("serve returned nil after a partial header; a stalled client must end the connection")
+ 		}
+ 	case <-time.After(2 * time.Second):
+-		t.Fatal("serve did not return within 2s of a 200ms read timeout")
++		t.Fatal("serve did not return within 2s of a 200ms idle timeout: Timeouts.Idle is not armed")
+ 	}
+ 	assertNoPayload(t, client, 100*time.Millisecond)
+ }
+ 
+ func TestMapError_ClassifiesStoreAndContextErrors(t *testing.T) {
+ 	tests := []struct {
+ 		name string
+ 		err  error
+ 		want NBDError
+ 	}{
+@@ -1005,20 +1005,55 @@ func TestConnection_WriteTruncatedPayloadIsAnError(t *testing.T) {
+ 			t.Fatal("serve returned nil after the client stopped mid-payload; the reply must not claim success")
+ 		}
+ 	case <-time.After(2 * time.Second):
+ 		t.Fatal("serve did not return after the client stopped mid-payload")
+ 	}
+ 	if st.writes != 0 {
+ 		t.Fatalf("the store saw %d writes for a payload the server never fully received", st.writes)
+ 	}
+ }
+ 
++// The payload read must be bounded by Read, not by whatever budget the header
++// read left behind on the connection.
++//
++// The fixture is the INVERSE of the header test: Read is short and Idle is long,
++// so a payload read that inherited the header's Idle budget is still waiting at
++// 1s. The client is deliberately NOT closed — closing it makes the read return on
++// EOF, which is why the committed TestConnection_WriteTruncatedPayloadIsAnError
++// (equal budgets, and it closes) passes with the arm deleted.
++func TestConnection_PayloadReadIsBoundedByRead(t *testing.T) {
++	st := newStoreFake()
++	h := newTestHandler(st, testExport(8192),
++		Timeouts{Read: 200 * time.Millisecond, Write: 5 * time.Second, Idle: 5 * time.Second})
++	client, done := serveHandler(t, h, testExportName)
++
++	// A header declaring 4096 bytes of payload, then 100 of them, then silence on
++	// an open connection: only a deadline can end this read.
++	sendRequest(t, client, &Request{Type: CmdWrite, Cookie: 16, Offset: 0, Length: 4096})
++	if _, err := client.Write(make([]byte, 100)); err != nil {
++		t.Fatalf("write partial payload: %v", err)
++	}
++
++	select {
++	case err := <-done:
++		if err == nil {
++			t.Fatal("serve returned nil after a partial payload; the read must fail")
++		}
++	case <-time.After(time.Second):
++		t.Fatal("serve did not return within 1s of a 200ms read timeout: the payload read is not bounded by Timeouts.Read")
++	}
++	if st.writes != 0 {
++		t.Fatalf("the store saw %d writes for a payload the server never fully received", st.writes)
++	}
++	_ = client.Close()
++}
++
+ // FUA is the assertion that makes the flag mean something: the spec says the
+ // server "MUST NOT send its reply to that command until all write operations
+ // ... have been completed and persisted to non-volatile storage", so the commit
+ // has to run before the reply is written.
+ //
+ // The check runs inside the store's Flush, on the server's goroutine, and hands
+ // the client read to the test goroutine over a channel — the reply is not in
+ // flight yet, so a read that succeeds means the reply was written first.
+ func TestConnection_WriteWithFUAIsDurableBeforeReply(t *testing.T) {
+ 	f := newWriteVolumeFixture(t)
+@@ -1296,20 +1331,40 @@ func TestConnection_WriteZeroesWithNoHoleIsAccepted(t *testing.T) {
+ 	client, _ := serveHandler(t, h, f.exp.Name)
+ 
+ 	if rep := writeZeroesThroughClient(t, client, 0, 4096, FlagNoHole); rep.Error != 0 {
+ 		t.Fatalf("WRITE_ZEROES with NBD_CMD_FLAG_NO_HOLE reply error = %d, want 0", rep.Error)
+ 	}
+ 	if st.punches != 1 {
+ 		t.Fatalf("the store saw %d punches, want 1", st.punches)
+ 	}
+ }
+ 
++// A TRIM whose block-store punch fails reaches the client as NBD_EIO, mapped by
++// mapError from whatever the store returned. It is a real path rather than a
++// hypothetical one: engine.Store.PunchHole is the call that fails when the local
++// store is closed underneath a live connection, and the metadata punch that
++// precedes it would have succeeded, so nothing else reports the failure.
++func TestConnection_TrimPunchFailureIsEIO(t *testing.T) {
++	f := newWriteVolumeFixture(t)
++	st := newStoreFake()
++	st.punchErr = errors.New("boom")
++	h := f.newHandler(t, st)
++	client, _ := serveHandler(t, h, f.exp.Name)
++
++	if rep := trimThroughClient(t, client, 0, 4096, 0); rep.Error != ErrEIO {
++		t.Fatalf("TRIM with a failing store punch reply error = %d, want ErrEIO (%d)", rep.Error, uint32(ErrEIO))
++	}
++	if st.punches != 1 {
++		t.Fatalf("the store saw %d punches, want 1", st.punches)
++	}
++}
++
+ // A zero-length TRIM is NBD_EINVAL, the same answer READ, WRITE and
+ // WRITE_ZEROES give. TRIM carries no payload either way, so the connection must
+ // stay usable for the next command.
+ func TestConnection_TrimZeroLengthIsEINVAL(t *testing.T) {
+ 	st := newStoreFake()
+ 	st.data[testPayloadID] = make([]byte, 4096)
+ 	h := newTestHandler(st, testExport(8192), testTimeouts())
+ 	client, _ := serveHandler(t, h, testExportName)
+ 
+ 	if rep := trimThroughClient(t, client, 0, 0, 0); rep.Error != ErrEINVAL {

@@ -1,0 +1,2023 @@
+# Review package: 8f0f64c3..042ead73
+
+## Commits
+042ead73 feat(nbd): connection loop and READ handler
+
+## Files changed
+ internal/adapter/common/doc.go                     |   2 +-
+ internal/adapter/common/normalize.go               |   8 +-
+ internal/adapter/common/read_payload.go            |   2 +-
+ internal/adapter/common/write_payload.go           |  21 +-
+ internal/adapter/nbd/connection.go                 | 334 +++++++++
+ internal/adapter/nbd/connection_test.go            | 771 +++++++++++++++++++++
+ internal/adapter/nbd/handlers_read.go              |  88 +++
+ internal/adapter/nbd/integration_test.go           | 214 ++++++
+ internal/adapter/nbd/reply.go                      |   6 -
+ .../nfs/v4/handlers/content_errmap_wiring_test.go  |   2 +-
+ pkg/adapter/nbd/adapter.go                         |  81 ++-
+ pkg/adapter/nbd/config.go                          |  10 +
+ pkg/adapter/nbd/healthcheck.go                     |  19 +-
+ pkg/adapter/nbd/healthcheck_test.go                |  31 +
+ 14 files changed, 1533 insertions(+), 56 deletions(-)
+
+## Diff
+diff --git a/internal/adapter/common/doc.go b/internal/adapter/common/doc.go
+index 915ebcb0..2c24d816 100644
+--- a/internal/adapter/common/doc.go
++++ b/internal/adapter/common/doc.go
+@@ -19,21 +19,21 @@
+ // for sizes above the largest tier).
+ //
+ // # Error mapping
+ //
+ // The metadata store error → protocol status translation lives in the
+ // per-adapter types packages (internal/adapter/nfs/types,
+ // internal/adapter/nfs/v4/types, internal/adapter/smb/types) as StatusFor
+ // / StatusForErr — the single source of truth per protocol, with a full
+ // enum-walk test per package. The SMB LOCK path uses StatusForLock /
+ // StatusForLockErr (lock-vs-general divergence, MS-SMB2 3.3.5.14).
+-// Block-store errors are classified here: normalizeBlockStoreError wraps
++// Block-store errors are classified here: NormalizeBlockStoreError wraps
+ // every error leaving ReadFromBlockStore / WriteToBlockStore /
+ // CommitBlockStore as a *merrs.StoreError (stale-handle for a closed
+ // store, I/O for everything else, original preserved as Cause), and
+ // ClassifyBlockStoreError maps a raw block-store error to its code for
+ // the raw-engine call sites that bypass the payload helpers.
+ //
+ // # Cache invalidation
+ //
+ // Cache invalidation is post-transaction by design: the caller commits the
+ // metadata transaction first, then invokes CacheInvalidator.InvalidateFile so
+diff --git a/internal/adapter/common/normalize.go b/internal/adapter/common/normalize.go
+index 006fc2e0..625ab00c 100644
+--- a/internal/adapter/common/normalize.go
++++ b/internal/adapter/common/normalize.go
+@@ -1,35 +1,37 @@
+ package common
+ 
+ import (
+ 	goerrors "errors"
+ 
+ 	merrs "github.com/marmos91/dittofs/pkg/metadata/errors"
+ )
+ 
+-// normalizeBlockStoreError converts a raw block-store error into a
++// NormalizeBlockStoreError converts a raw block-store error into a
+ // *merrs.StoreError so the wire mappers (the per-adapter StatusFor family)
+ // can see its code. Every non-nil error from ReadFromBlockStore,
+-// WriteToBlockStore, and CommitBlockStore passes through here exactly once:
++// WriteToBlockStore, and CommitBlockStore passes through here exactly once,
++// and a protocol adapter that maps a raw store error itself calls it first so
++// the classification below matches instead of collapsing to the generic row:
+ //
+ //   - engine.ErrStoreClosed (the share was removed or hot-reloaded
+ //     mid-transfer) wraps as the stale-handle row.
+ //   - journal.ErrLocalStoreFull (the local store is full and the write's
+ //     backpressure wait ran out) wraps as the no-space row.
+ //   - every other failure — CAS integrity sentinels, an unavailable remote
+ //     tier, durability-not-yet, an opaque engine fault, a canceled context —
+ //     wraps as the generic I/O row.
+ //
+ // The original error is preserved as Cause (multi-%w), so errors.Is and
+ // errors.As still traverse to the block sentinel for logging and tests.
+ // Callers that need the code directly use ClassifyBlockStoreError.
+-func normalizeBlockStoreError(err error) error {
++func NormalizeBlockStoreError(err error) error {
+ 	var storeErr *merrs.StoreError
+ 	if goerrors.As(err, &storeErr) {
+ 		// Already a StoreError (e.g. an engine op that surfaced a metadata
+ 		// error directly) — pass through so the code is not double-wrapped.
+ 		return err
+ 	}
+ 	code := ClassifyBlockStoreError(err)
+ 	return &merrs.StoreError{
+ 		Code:    code,
+ 		Message: err.Error(),
+diff --git a/internal/adapter/common/read_payload.go b/internal/adapter/common/read_payload.go
+index 24f45cf8..aca645e4 100644
+--- a/internal/adapter/common/read_payload.go
++++ b/internal/adapter/common/read_payload.go
+@@ -50,15 +50,15 @@ func ReadFromBlockStore(
+ 	defer cancel()
+ 	data := pool.Get(int(count))
+ 	n, readErr := blockStore.ReadAt(ctx, string(payloadID), data, offset)
+ 
+ 	if readErr == io.EOF || readErr == io.ErrUnexpectedEOF {
+ 		return BlockReadResult{Data: data[:n], EOF: true}, nil
+ 	}
+ 
+ 	if readErr != nil {
+ 		pool.Put(data)
+-		return BlockReadResult{}, normalizeBlockStoreError(readErr)
++		return BlockReadResult{}, NormalizeBlockStoreError(readErr)
+ 	}
+ 
+ 	return BlockReadResult{Data: data[:n], EOF: false}, nil
+ }
+diff --git a/internal/adapter/common/write_payload.go b/internal/adapter/common/write_payload.go
+index 86226f6f..5f6c28e5 100644
+--- a/internal/adapter/common/write_payload.go
++++ b/internal/adapter/common/write_payload.go
+@@ -1,17 +1,18 @@
+ package common
+ 
+ import (
+ 	"context"
+ 	"errors"
+ 
+ 	"github.com/marmos91/dittofs/internal/logger"
++	"github.com/marmos91/dittofs/pkg/block"
+ 	"github.com/marmos91/dittofs/pkg/block/engine"
+ 	"github.com/marmos91/dittofs/pkg/metadata"
+ )
+ 
+ // ErrNotDurableYet is returned by CommitBlockStore ONLY when a share has
+ // opted into strict honest-durability enforcement
+ // (config["require_durable_commit"] = true) and a CLOSE / COMMIT cannot
+ // honestly report success: the share's local store is NOT durable (e.g. an
+ // in-memory local store) AND the data has not yet reached a durable remote
+ // (the engine FlushResult is not Finalized, or the remote is itself not
+@@ -58,25 +59,37 @@ func WriteToBlockStore(
+ 	data []byte,
+ 	offset uint64,
+ ) error {
+ 	// Pass nil currentBlocks so the engine runs the legacy/dual-read
+ 	// path; discard the returned []ChunkRef. Caller-snapshot []ChunkRef
+ 	// threading lands in a later refactor.
+ 	ctx, cancel := WithRequestDeadline(ctx)
+ 	defer cancel()
+ 	_, err := blockStore.WriteAt(ctx, string(payloadID), nil, data, offset)
+ 	if err != nil {
+-		return normalizeBlockStoreError(err)
++		return NormalizeBlockStoreError(err)
+ 	}
+ 	return nil
+ }
+ 
++// Committer is the block-store surface CommitBlockStore reads. It is an
++// interface rather than *engine.Store so the durability rule can be exercised
++// against a fake, and so a caller that holds only the store's I/O surface can
++// still reach the one shared implementation of that rule instead of writing
++// its own copy. *engine.Store satisfies it.
++type Committer interface {
++	Flush(ctx context.Context, payloadID string) (*block.FlushResult, error)
++	LocalDurable() bool
++	RemoteDurable() bool
++	RequireDurableCommit() bool
++}
++
+ // CommitBlockStore is the COMMIT/flush seam used by NFSv3 COMMIT, NFSv4
+ // COMMIT, and SMB CLOSE. All three protocols today flush via
+ // engine.Flush(ctx, payloadID) with identical signatures; this helper wraps
+ // that call so a later refactor can add ChunkRef-aware plumbing once,
+ // keeping protocol-handler code unchanged.
+ //
+ // A hard flush error (I/O fault, remote.Put rejection, metadata error) is
+ // ALWAYS surfaced unchanged — engine.Flush returning a non-nil error
+ // propagates regardless of policy.
+ //
+@@ -102,31 +115,31 @@ func WriteToBlockStore(
+ //     path, no remote wait (the flag is a no-op for fs-local).
+ //
+ //   - memory local + durable remote (s3): success requires
+ //     FlushResult.Finalized; a transient unhealthy-remote flush returns
+ //     {Finalized:false} → ErrNotDurableYet so the client re-drives.
+ //
+ //   - memory local with no remote / a non-durable remote: never durable →
+ //     ErrNotDurableYet (the operator opted into honest failure).
+ func CommitBlockStore(
+ 	ctx context.Context,
+-	blockStore *engine.Store,
++	blockStore Committer,
+ 	payloadID metadata.PayloadID,
+ ) error {
+ 	ctx, cancel := WithRequestDeadline(ctx)
+ 	defer cancel()
+ 	res, err := blockStore.Flush(ctx, string(payloadID))
+ 	if err != nil {
+ 		// Hard error: unchanged behavior, normalized so the wire mappers see
+ 		// the code (a closed store wraps as the stale-handle row, the rest as
+ 		// the I/O row; the original error stays reachable via Cause).
+-		return normalizeBlockStoreError(err)
++		return NormalizeBlockStoreError(err)
+ 	}
+ 
+ 	// Observability: record the per-store durability decision at the
+ 	// ack point. engine.Flush returning nil only means the flush pump did not
+ 	// fault; in the DEFAULT (async) policy Finalized may still be false while
+ 	// the remote mirror catches up, and localDurable=true (fs local store)
+ 	// means the bytes already survive a restart regardless of Finalized. This
+ 	// single DEBUG line surfaces the exact (Finalized, local/remote durable)
+ 	// inputs so a saturated-CLOSE trace can confirm there is no silent window
+ 	// without adding a log line to the common (durable) hot path's behavior.
+@@ -161,21 +174,21 @@ func CommitBlockStore(
+ 	// Local store is volatile: success requires the data to have reached a
+ 	// durable remote (Finalized AND the remote is itself durable).
+ 	if finalized && remoteDurable {
+ 		return nil
+ 	}
+ 	// Not yet durable anywhere that survives a crash — report so the client
+ 	// re-drives. The bytes remain in local CAS and the syncer keeps mirroring.
+ 	// Normalized so the wire mappers see the I/O-class code while the
+ 	// ErrNotDurableYet sentinel stays reachable via Cause for tests and the
+ 	// durability policy's own retry classification.
+-	return normalizeBlockStoreError(ErrNotDurableYet)
++	return NormalizeBlockStoreError(ErrNotDurableYet)
+ }
+ 
+ // FlushStableWrite forces a file's cached data — and, when fileSync is set, its
+ // metadata — to stable storage so a WRITE that asked for more than UNSTABLE can
+ // be acknowledged at the level it asked for. It mirrors the COMMIT path: flush
+ // the block store, then persist the file's pending metadata.
+ //
+ // NFSv3 (RFC 1813 Section 3.3.7) and NFSv4 (RFC 7530 Section 16.36.4) draw the
+ // same line between the two stable levels:
+ //
+diff --git a/internal/adapter/nbd/connection.go b/internal/adapter/nbd/connection.go
+new file mode 100644
+index 00000000..d5823be0
+--- /dev/null
++++ b/internal/adapter/nbd/connection.go
+@@ -0,0 +1,334 @@
++package nbd
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"net"
++	"runtime/debug"
++	"sync/atomic"
++	"time"
++
++	"github.com/marmos91/dittofs/internal/adapter/common"
++	"github.com/marmos91/dittofs/internal/logger"
++	"github.com/marmos91/dittofs/pkg/block"
++	"github.com/marmos91/dittofs/pkg/block/engine"
++	"github.com/marmos91/dittofs/pkg/metadata"
++	merrs "github.com/marmos91/dittofs/pkg/metadata/errors"
++)
++
++// Timeouts bounds the three waits one NBD connection has.
++//
++// Read bounds reading one request header or payload. Idle bounds a connection
++// that has completed its handshake but sends nothing, so Read must be the
++// shorter of the two or a stalled client is held open by the wrong timer. Write
++// bounds writing one reply. The zero value of any field means no bound.
++type Timeouts struct {
++	Read  time.Duration
++	Write time.Duration
++	Idle  time.Duration
++}
++
++// BlockStore is the engine surface the wire handlers use.
++//
++// An interface rather than *engine.Store so the dispatch tests can drive
++// failure modes the engine cannot be made to produce on demand. The durability
++// accessors are here because the commit rule (common.CommitBlockStore) reads
++// them, and that rule must be the same one NFS COMMIT and SMB Flush use.
++// *engine.Store satisfies all seven methods.
++type BlockStore interface {
++	ReadAt(ctx context.Context, payloadID string, data []byte, offset uint64) (int, error)
++	WriteAt(ctx context.Context, payloadID string, currentBlocks []block.ChunkRef, data []byte, offset uint64) ([]block.ChunkRef, error)
++	PunchHole(ctx context.Context, payloadID string, currentBlocks []block.ChunkRef, offset, length uint64) ([]block.ChunkRef, error)
++	Flush(ctx context.Context, payloadID string) (*block.FlushResult, error)
++	LocalDurable() bool
++	RemoteDurable() bool
++	RequireDurableCommit() bool
++}
++
++// StoreResolver returns the block store that holds an export's bytes.
++//
++// A function type rather than a method on Handler so the dispatch tests can
++// inject a fake store. The production implementation wraps
++// common.ResolveForWrite, which is why this package never imports
++// pkg/controlplane/runtime.
++type StoreResolver func(ctx context.Context, exp *Export) (BlockStore, error)
++
++// Handler serves the NBD transmission phase: it resolves one export, resolves
++// that export's block store, and then dispatches commands until the connection
++// ends.
++//
++// It deliberately holds no *runtime.Runtime — RuntimeExporter owns that, and
++// keeping the runtime out of the wire layer is what makes the dispatch tests
++// possible without a control plane. It also holds no net.Conn, which is forced
++// by the framework rather than chosen: adapter.ConnectionHandler.Serve takes
++// only a context (pkg/adapter/base.go:38), so the socket is bound on Conn
++// instead.
++type Handler struct {
++	exporter Exporter
++	stores   StoreResolver
++	meta     *metadata.Service
++	id       Identity
++	timeouts Timeouts
++
++	// draining reports whether the adapter has begun shutting down. It is a
++	// closure over the base adapter's Shutdown channel rather than a flag of its
++	// own, so the two can never disagree.
++	draining func() bool
++
++	// degraded counts export and block-store resolutions that failed. A probe
++	// consumes the count (see TakeDegraded), so it is "since the last probe"
++	// rather than a running total.
++	degraded atomic.Int64
++}
++
++// NewHandler returns a handler for one adapter's connections.
++//
++// draining is a closure over the base adapter's shutdown signal, passed as a
++// function rather than as the base adapter itself so this package stays free of
++// any pkg/adapter import.
++func NewHandler(exporter Exporter, stores StoreResolver, meta *metadata.Service, id Identity, timeouts Timeouts, draining func() bool) *Handler {
++	return &Handler{
++		exporter: exporter,
++		stores:   stores,
++		meta:     meta,
++		id:       id,
++		timeouts: timeouts,
++		draining: draining,
++	}
++}
++
++// TakeDegraded returns how many export and block-store resolutions have failed
++// since the previous call, and resets the count.
++//
++// Swap rather than Load followed by Store: two steps let a concurrent increment
++// vanish between them.
++func (h *Handler) TakeDegraded() int64 { return h.degraded.Swap(0) }
++
++// authContext builds the metadata context one command runs under.
++//
++// It is built per command and never cached: it embeds the command's Context, so
++// a cached one would carry the first command's deadline and cancellation into
++// every later command on the connection. ShareReadOnly is the client-facing
++// ceiling and is applied here, not during the handshake's export resolution,
++// which deliberately resolves an export the operator already configured.
++func (h *Handler) authContext(ctx context.Context, exp *Export) *metadata.AuthContext {
++	uid, gid := h.id.UID, h.id.GID
++	return &metadata.AuthContext{
++		Context:       ctx,
++		Identity:      &metadata.Identity{UID: &uid, GID: &gid},
++		ShareReadOnly: exp.ReadOnly,
++	}
++}
++
++// Conn is one accepted TCP connection.
++//
++// It exists because adapter.ConnectionHandler.Serve takes no net.Conn
++// (pkg/adapter/base.go:38), so the socket has to be bound at construction. It
++// holds no protocol state of its own: the handshake result and the resolved
++// store live on the stack of serve, which is the only thing that can outlive
++// them safely.
++type Conn struct {
++	handler *Handler
++	conn    net.Conn
++}
++
++// NewConn returns the connection handler for one accepted socket.
++func NewConn(h *Handler, conn net.Conn) *Conn { return &Conn{handler: h, conn: conn} }
++
++// Serve runs one connection and recovers panics.
++//
++// The recover is not defensive habit: the base adapter's accept loop has none
++// (grep recover pkg/adapter/base.go returns nothing) and it invokes this on a
++// bare goroutine (pkg/adapter/base.go:373), so an unrecovered panic here takes
++// down the whole DittoFS process — every NFS and SMB connection with it. Both
++// sibling adapters recover for the same reason and in the same place: NFS at
++// pkg/adapter/nfs/connection.go:420 (handleConnectionClose, deferred at :111)
++// and SMB at pkg/adapter/smb/connection.go:474. Log at Error, not Debug: a
++// panic is unexpected by definition, and it is the only trace of why the
++// connection died.
++func (c *Conn) Serve(ctx context.Context) {
++	// The socket is closed here, after the recover defer below has logged a
++	// panic, because nothing else in the path closes it: the base adapter's
++	// accept loop only unregisters the connection, and its force-close runs only
++	// when the drain deadline expires. Without this the server's end would sit
++	// in CLOSE_WAIT until the finalizer ran. Both sibling adapters close in
++	// their deferred connection-close handler for the same reason.
++	defer func() { _ = c.conn.Close() }()
++	defer func() {
++		if r := recover(); r != nil {
++			logger.Error("Panic in NBD connection handler",
++				"remote", c.conn.RemoteAddr(), "error", r, "stack", string(debug.Stack()))
++		}
++	}()
++	if err := c.handler.serve(ctx, c.conn); err != nil && ctx.Err() == nil {
++		logger.Debug("NBD connection ended", "remote", c.conn.RemoteAddr(), "error", err)
++	}
++}
++
++// serve runs the handshake and then the transmission phase for one connection.
++//
++// It is unexported because it is the test entry point, not the framework's: the
++// dispatch tests call it directly so they keep the error return and never need
++// the Conn wrapper.
++func (h *Handler) serve(ctx context.Context, conn net.Conn) error {
++	exp, err := ServeHandshake(ctx, conn, h.exporter)
++	if err != nil {
++		// The handshake already told the client why, where the protocol has a
++		// way to.
++		return err
++	}
++
++	// Resolved once, not per command: the handle is fixed for the connection's
++	// life, so a per-command resolve would decode a handle and take a lock on
++	// every 4 KiB read.
++	bs, err := h.stores(ctx, exp)
++	if err != nil {
++		// Not a wire error: the connection ends, because every subsequent
++		// command would fail the same way. It is counted so a probe can report
++		// the adapter as degraded.
++		h.degraded.Add(1)
++		return fmt.Errorf("nbd: resolving the block store for export %q: %w", exp.Name, err)
++	}
++
++	for {
++		// The read deadline is armed before the read, and deliberately not
++		// while draining. initiateShutdown sets a 100 ms deadline on every
++		// active connection to unblock pending reads (pkg/adapter/base.go:447),
++		// and a fresh SetReadDeadline replaces it — so arming the full request
++		// budget here would hold the drain open for that whole budget. Leaving
++		// the short deadline in place is what lets an idle connection close
++		// inside the drain window.
++		if !h.draining() {
++			if err := conn.SetReadDeadline(time.Now().Add(h.timeouts.Read)); err != nil {
++				return err
++			}
++		}
++
++		req, err := ReadRequest(conn)
++		if err != nil {
++			return err
++		}
++
++		// DISC is handled before the draining check because it has no reply in
++		// any state: "There is no reply to an NBD_CMD_DISC." Offset and length
++		// MUST be zero; a nonzero one is a malformed request, answered rather
++		// than acted on so the connection stays usable.
++		if req.Type == CmdDisc {
++			if req.Offset != 0 || req.Length != 0 {
++				if err := h.writeReply(conn, req.Cookie, ErrEINVAL, nil); err != nil {
++					return err
++				}
++				continue
++			}
++			return nil
++		}
++
++		if h.draining() {
++			// The request arrived before the read unblocked, so answer it rather
++			// than serve it: NBD_ESHUTDOWN is the protocol's "reconnect" signal,
++			// which is what the kernel's dead-connection timeout waits for. The
++			// connection is not closed here — closing on the first observation
++			// makes the client's kernel error the device instead of pausing it,
++			// and the base adapter's drain deadline is the backstop.
++			if err := h.writeReply(conn, req.Cookie, ErrESHUTDOWN, nil); err != nil {
++				return err
++			}
++			continue
++		}
++
++		switch req.Type {
++		case CmdRead:
++			if err := h.handleRead(ctx, bs, exp, req, conn); err != nil {
++				return err
++			}
++
++		default:
++			// Every command the adapter advertises but does not yet serve
++			// (WRITE, FLUSH, TRIM, WRITE_ZEROES, CACHE, BLOCK_STATUS) and every
++			// value the spec does not define. An unimplemented command is an
++			// invalid command: NBD_ENOTSUP is reserved by the spec for
++			// WRITE_ZEROES with FAST_ZERO, which the adapter does not advertise.
++			if err := h.writeReply(conn, req.Cookie, ErrEINVAL, nil); err != nil {
++				return err
++			}
++		}
++	}
++}
++
++// writeReply writes one simple reply header, followed by the payload when there
++// is one.
++//
++// The write deadline is armed here, before every reply write, so a client that
++// stops reading cannot hold the connection past the configured budget.
++func (h *Handler) writeReply(conn net.Conn, cookie uint64, nbdErr NBDError, payload []byte) error {
++	if err := conn.SetWriteDeadline(time.Now().Add(h.timeouts.Write)); err != nil {
++		return err
++	}
++	if err := writeSimpleReply(conn, cookie, nbdErr); err != nil {
++		return err
++	}
++	if len(payload) == 0 {
++		return nil
++	}
++	_, err := conn.Write(payload)
++	return err
++}
++
++// mapError translates a block-store error to the transmission-phase value the
++// client sees.
++//
++// It normalizes first, and that is not optional: the engine returns raw
++// sentinels as well as *merrs.StoreError values, and normalization is what turns
++// a raw one into a *merrs.StoreError with the right code while leaving an
++// already-wrapped one alone. A classifier that skipped it would report NBD_EIO
++// for a full disk, which is exactly the class of bug this mapping exists to
++// prevent.
++func mapError(err error) NBDError {
++	if err == nil {
++		return 0
++	}
++	normalized := common.NormalizeBlockStoreError(err)
++
++	// The store failures are tested before the context pair, because a store
++	// failure wrapped in a cancellation should report the store failure: the
++	// operator needs to know the store is gone, not that a context expired.
++	// errors.Is walks the whole wrap chain, so one error can match several
++	// cases and the first match wins.
++	switch {
++	case errors.Is(normalized, engine.ErrStoreClosed):
++		// The store is gone, so the client should error the device. NBD_EIO
++		// rather than NBD_ESHUTDOWN: ESHUTDOWN means "reconnect", and a closed
++		// store is not a restart.
++		logger.Debug("nbd: block store closed under an in-flight operation", "error", err)
++		return ErrEIO
++	case errors.Is(normalized, common.ErrNotDurableYet):
++		// FLUSH promised durability and it could not be delivered, so there is
++		// no honest success to send.
++		logger.Debug("nbd: flush did not reach a durable store", "error", err)
++		return ErrEIO
++	}
++
++	var storeErr *merrs.StoreError
++	if errors.As(normalized, &storeErr) {
++		switch storeErr.Code {
++		case merrs.ErrNoSpace:
++			logger.Debug("nbd: block store is full", "error", err)
++			return ErrENOSPC
++		case merrs.ErrPermissionDenied:
++			logger.Debug("nbd: block store denied the operation", "error", err)
++			return ErrEPERM
++		}
++	}
++
++	if errors.Is(normalized, context.Canceled) || errors.Is(normalized, context.DeadlineExceeded) {
++		// Expected: the request budget expired or the adapter is shutting down.
++		logger.Debug("nbd: command context ended", "error", err)
++		return ErrESHUTDOWN
++	}
++
++	// Everything left is an opaque engine fault, which is unexpected by
++	// definition, so it is the one class logged at Error.
++	logger.Error("nbd: unmapped block store error", "error", err)
++	return ErrEIO
++}
+diff --git a/internal/adapter/nbd/connection_test.go b/internal/adapter/nbd/connection_test.go
+new file mode 100644
+index 00000000..fd5a8752
+--- /dev/null
++++ b/internal/adapter/nbd/connection_test.go
+@@ -0,0 +1,771 @@
++package nbd
++
++import (
++	"bytes"
++	"context"
++	"encoding/binary"
++	"errors"
++	"fmt"
++	"io"
++	"math"
++	"net"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/marmos91/dittofs/internal/adapter/common"
++	"github.com/marmos91/dittofs/pkg/block"
++	"github.com/marmos91/dittofs/pkg/block/engine"
++	"github.com/marmos91/dittofs/pkg/block/journal"
++	merrs "github.com/marmos91/dittofs/pkg/metadata/errors"
++)
++
++// storeFake is the minimum surface a handler needs. It is deliberately not an
++// engine.Store: these tests are about dispatch and error mapping, and a real
++// engine would make every failure mode a store failure mode.
++//
++// The durability accessors are here because BlockStore declares them; the
++// constructor's values describe the common production shape (a durable local
++// store with a durable remote and no strict enforcement), so a commit takes the
++// localDurable fast path. A test that needs the strict path sets them itself.
++type storeFake struct {
++	data     map[string][]byte
++	readErr  error
++	writeErr error
++	flushErr error
++	reads    int
++	writes   int
++	flushes  int
++
++	localDurable   bool
++	remoteDurable  bool
++	requireDurable bool
++
++	// panicOnRead makes ReadAt panic instead of returning, so a test can drive
++	// a panic from below the dispatcher — exactly where a real one would (a nil
++	// map, a slice bounds error, a bad type assertion on an engine-returned
++	// store).
++	panicOnRead bool
++}
++
++func newStoreFake() *storeFake {
++	return &storeFake{
++		data:          map[string][]byte{},
++		localDurable:  true,
++		remoteDurable: true,
++	}
++}
++
++func (s *storeFake) ReadAt(_ context.Context, id string, buf []byte, off uint64) (int, error) {
++	s.reads++
++	if s.panicOnRead {
++		panic("storeFake: ReadAt panicked on purpose")
++	}
++	if s.readErr != nil {
++		return 0, s.readErr
++	}
++	b := s.data[id]
++	if off >= uint64(len(b)) {
++		for i := range buf {
++			buf[i] = 0
++		}
++		return len(buf), nil
++	}
++	n := copy(buf, b[off:])
++	for i := n; i < len(buf); i++ {
++		buf[i] = 0
++	}
++	return len(buf), nil
++}
++
++func (s *storeFake) WriteAt(_ context.Context, id string, currentBlocks []block.ChunkRef, data []byte, off uint64) ([]block.ChunkRef, error) {
++	s.writes++
++	if s.writeErr != nil {
++		return currentBlocks, s.writeErr
++	}
++	if s.data[id] == nil {
++		s.data[id] = nil
++	}
++	end := off + uint64(len(data))
++	if end > uint64(len(s.data[id])) {
++		grown := make([]byte, end)
++		copy(grown, s.data[id])
++		s.data[id] = grown
++	}
++	copy(s.data[id][off:], data)
++	return currentBlocks, nil
++}
++
++func (s *storeFake) PunchHole(_ context.Context, id string, currentBlocks []block.ChunkRef, off, length uint64) ([]block.ChunkRef, error) {
++	b := s.data[id]
++	for i := off; i < off+length && i < uint64(len(b)); i++ {
++		b[i] = 0
++	}
++	return currentBlocks, nil
++}
++
++func (s *storeFake) Flush(_ context.Context, _ string) (*block.FlushResult, error) {
++	s.flushes++
++	if s.flushErr != nil {
++		return nil, s.flushErr
++	}
++	return &block.FlushResult{}, nil
++}
++
++func (s *storeFake) LocalDurable() bool         { return s.localDurable }
++func (s *storeFake) RemoteDurable() bool        { return s.remoteDurable }
++func (s *storeFake) RequireDurableCommit() bool { return s.requireDurable }
++
++// testExportName is the export every connection test resolves.
++const testExportName = "/export/boot"
++
++// testPayloadID is the block-store payload the fixture export addresses.
++const testPayloadID = "p1"
++
++// testExport is the export the fixture resolves: a volume of size bytes whose
++// data lives at testPayloadID.
++func testExport(size uint64) *Export {
++	return &Export{Name: testExportName, Size: size, PayloadID: testPayloadID}
++}
++
++// exporterFor returns an exporter that resolves testExportName to exp. It
++// reuses fakeExporter from handshake_test.go, which is in this package.
++func exporterFor(exp *Export) Exporter {
++	return &fakeExporter{exports: map[string]*Export{testExportName: exp}}
++}
++
++// resolverFor returns a StoreResolver that always hands back st.
++func resolverFor(st BlockStore) StoreResolver {
++	return func(context.Context, *Export) (BlockStore, error) { return st, nil }
++}
++
++// testTimeouts is what the fixture arms. Read is generous enough that no test
++// races it; TestConnection_PartialHeaderTimesOut sets its own.
++func testTimeouts() Timeouts {
++	return Timeouts{Read: 5 * time.Second, Write: 5 * time.Second, Idle: 5 * time.Second}
++}
++
++// newTestHandler builds a handler over st for one export, with draining always
++// false.
++func newTestHandler(st BlockStore, exp *Export, timeouts Timeouts) *Handler {
++	return NewHandler(exporterFor(exp), resolverFor(st), nil,
++		Identity{UID: 65534, GID: 65534}, timeouts, func() bool { return false })
++}
++
++// serveConn runs h.serve on server and returns a channel carrying its result.
++// The tests drive the client side over the pipe(t) helper's other end.
++func serveConn(h *Handler, server net.Conn) chan error {
++	done := make(chan error, 1)
++	go func() { done <- h.serve(context.Background(), server) }()
++	return done
++}
++
++// completeHandshake reads the greeting, sends client flags, asks for name with
++// NBD_OPT_GO, and drains the option replies through the terminating ACK. On
++// return the connection is in the transmission phase.
++func completeHandshake(t *testing.T, client net.Conn, name string) {
++	t.Helper()
++	readGreeting(t, client)
++	sendClientFlags(t, client, 1) // NBD_FLAG_C_FIXED_NEWSTYLE
++	sendOption(t, client, OptGO, goPayload(name))
++	for {
++		var hdr [20]byte
++		if _, err := io.ReadFull(client, hdr[:]); err != nil {
++			t.Fatalf("read handshake reply: %v", err)
++		}
++		typ := OptionReplyType(binary.BigEndian.Uint32(hdr[12:16]))
++		data := make([]byte, binary.BigEndian.Uint32(hdr[16:20]))
++		if len(data) > 0 {
++			if _, err := io.ReadFull(client, data); err != nil {
++				t.Fatalf("read handshake reply payload: %v", err)
++			}
++		}
++		if typ == RepAck {
++			return
++		}
++	}
++}
++
++// sendRequest encodes one transmission-phase request. The magic is filled in
++// when the caller leaves it zero, since every request carries the same value.
++func sendRequest(t *testing.T, w io.Writer, req *Request) {
++	t.Helper()
++	if req.Magic == 0 {
++		req.Magic = requestMagic
++	}
++	if err := req.Encode(w); err != nil {
++		t.Fatalf("encode request: %v", err)
++	}
++}
++
++// readReplyHeader reads one transmission-phase reply header and checks its
++// magic.
++func readReplyHeader(t *testing.T, r io.Reader) *Reply {
++	t.Helper()
++	rep, err := ReadReply(r)
++	if err != nil {
++		t.Fatalf("read reply: %v", err)
++	}
++	if rep.Magic != simpleReplyMagic {
++		t.Fatalf("reply magic = %#x, want %#x", rep.Magic, uint32(simpleReplyMagic))
++	}
++	return rep
++}
++
++// readPayload reads n bytes of reply payload.
++func readPayload(t *testing.T, r io.Reader, n int) []byte {
++	t.Helper()
++	buf := make([]byte, n)
++	if _, err := io.ReadFull(r, buf); err != nil {
++		t.Fatalf("read %d-byte payload: %v", n, err)
++	}
++	return buf
++}
++
++// assertNoPayload asserts nothing arrives on the connection within d. An error
++// reply carries no payload, and a closed connection is also "nothing".
++func assertNoPayload(t *testing.T, client net.Conn, d time.Duration) {
++	t.Helper()
++	if err := client.SetReadDeadline(time.Now().Add(d)); err != nil {
++		t.Fatalf("set read deadline: %v", err)
++	}
++	defer func() { _ = client.SetReadDeadline(time.Time{}) }()
++	var b [1]byte
++	if n, err := client.Read(b[:]); err == nil {
++		t.Fatalf("expected no payload after the reply, read %d byte(s)", n)
++	}
++}
++
++// readReplyAndPayload sends a READ and returns its reply header plus the
++// payload that follows a successful one.
++func readReplyAndPayload(t *testing.T, client net.Conn, req *Request) (*Reply, []byte) {
++	t.Helper()
++	sendRequest(t, client, req)
++	rep := readReplyHeader(t, client)
++	if rep.Error != 0 {
++		return rep, nil
++	}
++	return rep, readPayload(t, client, int(req.Length))
++}
++
++func TestConnection_ReadServesBytes(t *testing.T) {
++	want := make([]byte, 4096)
++	for i := range want {
++		want[i] = byte(i % 251)
++	}
++	st := newStoreFake()
++	st.data[testPayloadID] = want
++
++	h := newTestHandler(st, testExport(8192), testTimeouts())
++	server, client := pipe(t)
++	serveConn(h, server)
++	completeHandshake(t, client, testExportName)
++
++	rep, got := readReplyAndPayload(t, client, &Request{
++		Type: CmdRead, Cookie: 7, Offset: 0, Length: 4096,
++	})
++	if rep.Error != 0 {
++		t.Fatalf("READ reply error = %d, want 0", rep.Error)
++	}
++	if rep.Cookie != 7 {
++		t.Fatalf("READ reply cookie = %d, want 7", rep.Cookie)
++	}
++	if !bytes.Equal(got, want) {
++		t.Fatalf("READ returned %d bytes that do not match the fixture", len(got))
++	}
++}
++
++func TestConnection_ReadServesZerosForUnwrittenRange(t *testing.T) {
++	st := newStoreFake()
++	st.data[testPayloadID] = make([]byte, 4096)
++
++	h := newTestHandler(st, testExport(8192), testTimeouts())
++	server, client := pipe(t)
++	serveConn(h, server)
++	completeHandshake(t, client, testExportName)
++
++	rep, got := readReplyAndPayload(t, client, &Request{
++		Type: CmdRead, Cookie: 1, Offset: 4096, Length: 4096,
++	})
++	if rep.Error != 0 {
++		t.Fatalf("READ past the written range returned error %d; a hole reads as zeros, not as an error", rep.Error)
++	}
++	if !bytes.Equal(got, make([]byte, 4096)) {
++		t.Fatal("READ past the written range did not return zeros")
++	}
++}
++
++func TestConnection_UnknownCommandIsEINVAL(t *testing.T) {
++	st := newStoreFake()
++	h := newTestHandler(st, testExport(8192), testTimeouts())
++	server, client := pipe(t)
++	serveConn(h, server)
++	completeHandshake(t, client, testExportName)
++
++	sendRequest(t, client, &Request{Type: Command(99), Cookie: 3, Length: 4096})
++	rep := readReplyHeader(t, client)
++	if rep.Error != ErrEINVAL {
++		t.Fatalf("unknown command reply error = %d, want ErrEINVAL (%d)", rep.Error, uint32(ErrEINVAL))
++	}
++	if rep.Cookie != 3 {
++		t.Fatalf("unknown command reply cookie = %d, want 3", rep.Cookie)
++	}
++	// A reply header for a command whose reply shape is unknown must not be
++	// followed by data.
++	assertNoPayload(t, client, 100*time.Millisecond)
++}
++
++func TestConnection_UnimplementedCommandIsEINVAL(t *testing.T) {
++	st := newStoreFake()
++	h := newTestHandler(st, testExport(8192), testTimeouts())
++	server, client := pipe(t)
++	serveConn(h, server)
++	completeHandshake(t, client, testExportName)
++
++	sendRequest(t, client, &Request{Type: CmdCache, Cookie: 4})
++	rep := readReplyHeader(t, client)
++	// NBD_ENOTSUP is reserved by the spec for WRITE_ZEROES with FAST_ZERO,
++	// which the adapter does not advertise; a command it does not implement is
++	// an invalid command.
++	if rep.Error != ErrEINVAL {
++		t.Fatalf("unimplemented command reply error = %d, want ErrEINVAL (%d)", rep.Error, uint32(ErrEINVAL))
++	}
++}
++
++// TestConnection_WriteIsEINVALBeforeTask5 pins the dispatcher's default branch
++// for a command the adapter advertises but does not yet serve. Task 5 replaces
++// this with the real WRITE handler.
++func TestConnection_WriteIsEINVALBeforeTask5(t *testing.T) {
++	st := newStoreFake()
++	h := newTestHandler(st, testExport(8192), testTimeouts())
++	server, client := pipe(t)
++	serveConn(h, server)
++	completeHandshake(t, client, testExportName)
++
++	sendRequest(t, client, &Request{Type: CmdWrite, Cookie: 5, Offset: 0, Length: 4096})
++	rep := readReplyHeader(t, client)
++	if rep.Error != ErrEINVAL {
++		t.Fatalf("WRITE reply error = %d, want ErrEINVAL (%d) while the write path is unimplemented", rep.Error, uint32(ErrEINVAL))
++	}
++	if st.writes != 0 {
++		t.Fatalf("the store saw %d writes for an unimplemented command", st.writes)
++	}
++}
++
++func TestConnection_ErrorsCarryTheCookie(t *testing.T) {
++	st := newStoreFake()
++	st.readErr = errors.New("boom")
++
++	h := newTestHandler(st, testExport(8192), testTimeouts())
++	server, client := pipe(t)
++	serveConn(h, server)
++	completeHandshake(t, client, testExportName)
++
++	sendRequest(t, client, &Request{Type: CmdRead, Cookie: 0xdeadbeef, Offset: 0, Length: 4096})
++	rep := readReplyHeader(t, client)
++	if rep.Error != ErrEIO {
++		t.Fatalf("failing READ reply error = %d, want ErrEIO (%d)", rep.Error, uint32(ErrEIO))
++	}
++	// A dropped cookie makes a client hang forever waiting for the reply to a
++	// request it cannot match.
++	if rep.Cookie != 0xdeadbeef {
++		t.Fatalf("failing READ reply cookie = %#x, want 0xdeadbeef", rep.Cookie)
++	}
++	assertNoPayload(t, client, 100*time.Millisecond)
++}
++
++func TestConnection_DiscClosesWithoutReply(t *testing.T) {
++	st := newStoreFake()
++	h := newTestHandler(st, testExport(8192), testTimeouts())
++	server, client := pipe(t)
++	done := serveConn(h, server)
++	completeHandshake(t, client, testExportName)
++
++	sendRequest(t, client, &Request{Type: CmdDisc})
++
++	select {
++	case err := <-done:
++		if err != nil {
++			t.Fatalf("serve returned %v after DISC; a deliberate disconnect is not an error", err)
++		}
++	case <-time.After(2 * time.Second):
++		t.Fatal("serve did not return after DISC")
++	}
++	// "There is no reply to an NBD_CMD_DISC."
++	assertNoPayload(t, client, 100*time.Millisecond)
++}
++
++// The base adapter's accept loop has no recover (pkg/adapter/base.go:373 runs
++// the handler on a bare goroutine), so a panic that escapes here does not kill
++// the connection — it kills the process, and with it every NFS and SMB
++// connection. Both sibling adapters recover for this reason: NFS at
++// pkg/adapter/nfs/connection.go:420, SMB at pkg/adapter/smb/connection.go:474.
++//
++// The assertion is "it came back", and that is sufficient: if the recover is
++// missing the panic unwinds the goroutine and the test binary dies, so the
++// failure mode is a crashed package rather than a failed assertion. The test
++// deliberately does not wrap the call in its own recover — that would make it
++// pass whether or not Conn.Serve has one.
++func TestConn_PanicInHandlerDoesNotKillTheProcess(t *testing.T) {
++	st := newStoreFake()
++	st.panicOnRead = true
++
++	h := newTestHandler(st, testExport(8192), testTimeouts())
++	server, client := pipe(t)
++
++	done := make(chan struct{})
++	go func() {
++		defer close(done)
++		NewConn(h, server).Serve(context.Background())
++	}()
++
++	completeHandshake(t, client, testExportName)
++	sendRequest(t, client, &Request{Type: CmdRead, Cookie: 1, Offset: 0, Length: 4096})
++
++	select {
++	case <-done:
++	case <-time.After(2 * time.Second):
++		t.Fatal("Conn.Serve did not return after the handler panicked")
++	}
++}
++
++// The store is resolved after the handshake, so a resolver that fails is the
++// only way to reach this path deterministically: the window between the
++// handshake ACK and the resolution is a few microseconds on the server's own
++// goroutine, so no external test can land a share-removal inside it.
++func TestConnection_FailedStoreResolutionDegradesAndCounts(t *testing.T) {
++	sentinel := errors.New("store unavailable")
++	h := NewHandler(exporterFor(testExport(8192)),
++		func(context.Context, *Export) (BlockStore, error) { return nil, sentinel },
++		nil, Identity{UID: 65534, GID: 65534}, testTimeouts(), func() bool { return false })
++
++	server, client := pipe(t)
++	done := serveConn(h, server)
++	completeHandshake(t, client, testExportName)
++
++	// Asserted in this order: checking the consumption first would pass on a
++	// counter that was never incremented.
++	select {
++	case err := <-done:
++		if err == nil {
++			t.Fatal("serve returned nil after the store resolution failed; the connection must end")
++		}
++	case <-time.After(2 * time.Second):
++		t.Fatal("serve did not return after the store resolution failed")
++	}
++	if got := h.TakeDegraded(); got != 1 {
++		t.Fatalf("TakeDegraded() = %d, want 1", got)
++	}
++	if got := h.TakeDegraded(); got != 0 {
++		t.Fatalf("second TakeDegraded() = %d, want 0: the probe must consume the count", got)
++	}
++}
++
++// The last byte of the device is addressable. Only offset+length > size is out
++// of range.
++func TestConnection_ReadAtExactEndIsServed(t *testing.T) {
++	want := make([]byte, 4096)
++	for i := range want {
++		want[i] = byte(i%251) ^ 0x5a
++	}
++	st := newStoreFake()
++	st.data[testPayloadID] = append(make([]byte, 4096), want...)
++
++	h := newTestHandler(st, testExport(8192), testTimeouts())
++	server, client := pipe(t)
++	serveConn(h, server)
++	completeHandshake(t, client, testExportName)
++
++	rep, got := readReplyAndPayload(t, client, &Request{
++		Type: CmdRead, Cookie: 1, Offset: 4096, Length: 4096,
++	})
++	if rep.Error != 0 {
++		t.Fatalf("READ ending exactly at the export end returned error %d, want 0: the last byte is addressable", rep.Error)
++	}
++	if !bytes.Equal(got, want) {
++		t.Fatal("READ ending exactly at the export end returned the wrong bytes")
++	}
++}
++
++func TestConnection_ReadPastEndIsEINVAL(t *testing.T) {
++	st := newStoreFake()
++	st.data[testPayloadID] = make([]byte, 8192)
++
++	h := newTestHandler(st, testExport(8192), testTimeouts())
++	server, client := pipe(t)
++	serveConn(h, server)
++	completeHandshake(t, client, testExportName)
++
++	sendRequest(t, client, &Request{Type: CmdRead, Cookie: 1, Offset: 4096, Length: 4097})
++	rep := readReplyHeader(t, client)
++	if rep.Error != ErrEINVAL {
++		t.Fatalf("READ past the export end reply error = %d, want ErrEINVAL (%d)", rep.Error, uint32(ErrEINVAL))
++	}
++	assertNoPayload(t, client, 100*time.Millisecond)
++}
++
++func TestConnection_ReadZeroLengthIsEINVAL(t *testing.T) {
++	st := newStoreFake()
++	h := newTestHandler(st, testExport(8192), testTimeouts())
++	server, client := pipe(t)
++	serveConn(h, server)
++	completeHandshake(t, client, testExportName)
++
++	sendRequest(t, client, &Request{Type: CmdRead, Cookie: 1, Offset: 0, Length: 0})
++	rep := readReplyHeader(t, client)
++	if rep.Error != ErrEINVAL {
++		t.Fatalf("zero-length READ reply error = %d, want ErrEINVAL (%d)", rep.Error, uint32(ErrEINVAL))
++	}
++	assertNoPayload(t, client, 100*time.Millisecond)
++	if st.reads != 0 {
++		t.Fatalf("the store saw %d reads for a zero-length request", st.reads)
++	}
++}
++
++// Not EOVERFLOW: the spec reserves that for READ with NBD_CMD_FLAG_DF and for
++// payload-less over-max requests, neither of which the adapter supports. Not
++// EINVAL either — the request is not out of range, it cannot be interpreted at
++// all. The check must not be `offset+length > size` with a wrapping add.
++func TestConnection_OffsetPlusLengthOverflowIsEIO(t *testing.T) {
++	st := newStoreFake()
++	h := newTestHandler(st, testExport(8192), testTimeouts())
++	server, client := pipe(t)
++	serveConn(h, server)
++	completeHandshake(t, client, testExportName)
++
++	sendRequest(t, client, &Request{Type: CmdRead, Cookie: 1, Offset: math.MaxUint64, Length: 4096})
++	rep := readReplyHeader(t, client)
++	if rep.Error != ErrEIO {
++		t.Fatalf("overflowing READ reply error = %d, want ErrEIO (%d)", rep.Error, uint32(ErrEIO))
++	}
++	assertNoPayload(t, client, 100*time.Millisecond)
++	if st.reads != 0 {
++		t.Fatalf("the store saw %d reads for an overflowing request", st.reads)
++	}
++}
++
++// FUA is valid on every command once SEND_FUA is advertised: the spec says
++// "the server MUST accept all commands with this bit set (even by ignoring the
++// bit)" and notes "existing clients are known to set this bit on other
++// commands". A READ writes nothing, so the bit is ignored and the read
++// succeeds. Refusing would break real clients for a guarantee nobody asked for.
++func TestConnection_ReadWithFUAFlagSucceeds(t *testing.T) {
++	want := make([]byte, 4096)
++	for i := range want {
++		want[i] = 0xa5
++	}
++	st := newStoreFake()
++	st.data[testPayloadID] = want
++
++	h := newTestHandler(st, testExport(8192), testTimeouts())
++	server, client := pipe(t)
++	serveConn(h, server)
++	completeHandshake(t, client, testExportName)
++
++	rep, got := readReplyAndPayload(t, client, &Request{
++		Type: CmdRead, Flags: FlagFUA, Cookie: 1, Offset: 0, Length: 4096,
++	})
++	if rep.Error != 0 {
++		t.Fatalf("READ with NBD_CMD_FLAG_FUA returned error %d, want 0", rep.Error)
++	}
++	if !bytes.Equal(got, want) {
++		t.Fatal("READ with NBD_CMD_FLAG_FUA returned the wrong bytes")
++	}
++}
++
++// NO_HOLE is documented for WRITE_ZEROES only, so on WRITE it is a flag "not
++// explicitly documented as applicable to the given request" → NBD_EINVAL.
++func TestConnection_WriteWithNoHoleFlagIsEINVAL(t *testing.T) {
++	st := newStoreFake()
++	h := newTestHandler(st, testExport(8192), testTimeouts())
++	server, client := pipe(t)
++	serveConn(h, server)
++	completeHandshake(t, client, testExportName)
++
++	sendRequest(t, client, &Request{Type: CmdWrite, Flags: FlagNoHole, Cookie: 1, Offset: 0, Length: 4096})
++	rep := readReplyHeader(t, client)
++	if rep.Error != ErrEINVAL {
++		t.Fatalf("WRITE with NBD_CMD_FLAG_NO_HOLE reply error = %d, want ErrEINVAL (%d)", rep.Error, uint32(ErrEINVAL))
++	}
++}
++
++// DF, REQ_ONE and FAST_ZERO are each gated behind an advertisement the adapter
++// does not make, so none of them may appear on a READ.
++func TestConnection_UnadvertisedFlagIsEINVAL(t *testing.T) {
++	for _, flag := range []CommandFlags{FlagDF, FlagReqOne, FlagFastZero} {
++		t.Run(flagName(flag), func(t *testing.T) {
++			st := newStoreFake()
++			h := newTestHandler(st, testExport(8192), testTimeouts())
++			server, client := pipe(t)
++			serveConn(h, server)
++			completeHandshake(t, client, testExportName)
++
++			sendRequest(t, client, &Request{Type: CmdRead, Flags: flag, Cookie: 1, Offset: 0, Length: 4096})
++			rep := readReplyHeader(t, client)
++			if rep.Error != ErrEINVAL {
++				t.Fatalf("READ with %s reply error = %d, want ErrEINVAL (%d)", flagName(flag), rep.Error, uint32(ErrEINVAL))
++			}
++			assertNoPayload(t, client, 100*time.Millisecond)
++			if st.reads != 0 {
++				t.Fatalf("the store saw %d reads for a request with %s set", st.reads, flagName(flag))
++			}
++		})
++	}
++}
++
++// A command that arrives while the adapter is draining is answered with
++// NBD_ESHUTDOWN rather than served: it is the protocol's "reconnect" signal,
++// which is what the kernel's dead-connection timeout waits for. The connection
++// is deliberately NOT closed on the first draining observation — closing
++// immediately is what makes the client's kernel error the device instead of
++// pausing it, and the base adapter's drain deadline is the backstop.
++func TestConnection_DrainingAnswersESHUTDOWN(t *testing.T) {
++	st := newStoreFake()
++	st.data[testPayloadID] = make([]byte, 4096)
++
++	var draining atomic.Bool
++	h := NewHandler(exporterFor(testExport(8192)), resolverFor(st), nil,
++		Identity{UID: 65534, GID: 65534}, testTimeouts(), draining.Load)
++
++	server, client := pipe(t)
++	serveConn(h, server)
++	completeHandshake(t, client, testExportName)
++
++	draining.Store(true)
++
++	sendRequest(t, client, &Request{Type: CmdRead, Cookie: 9, Offset: 0, Length: 4096})
++	rep := readReplyHeader(t, client)
++	if rep.Error != ErrESHUTDOWN {
++		t.Fatalf("READ while draining reply error = %d, want ErrESHUTDOWN (%d)", rep.Error, uint32(ErrESHUTDOWN))
++	}
++	if rep.Cookie != 9 {
++		t.Fatalf("draining reply cookie = %d, want 9", rep.Cookie)
++	}
++	// The request must not have reached the store: it is answered, not served.
++	if st.reads != 0 {
++		t.Fatalf("the store saw %d reads for a command answered while draining", st.reads)
++	}
++	// The connection stays open, so a second command is still answerable.
++	sendRequest(t, client, &Request{Type: CmdRead, Cookie: 10, Offset: 0, Length: 4096})
++	if rep := readReplyHeader(t, client); rep.Error != ErrESHUTDOWN {
++		t.Fatalf("second draining READ reply error = %d, want ErrESHUTDOWN (%d)", rep.Error, uint32(ErrESHUTDOWN))
++	}
++}
++
++func flagName(f CommandFlags) string {
++	switch f {
++	case FlagFUA:
++		return "NBD_CMD_FLAG_FUA"
++	case FlagNoHole:
++		return "NBD_CMD_FLAG_NO_HOLE"
++	case FlagDF:
++		return "NBD_CMD_FLAG_DF"
++	case FlagReqOne:
++		return "NBD_CMD_FLAG_REQ_ONE"
++	case FlagFastZero:
++		return "NBD_CMD_FLAG_FAST_ZERO"
++	default:
++		return "flag"
++	}
++}
++
++// A client that sends a partial header and stalls must not hold the connection
++// open forever, and must not make the server allocate for a length it never
++// sent.
++func TestConnection_PartialHeaderTimesOut(t *testing.T) {
++	st := newStoreFake()
++	h := newTestHandler(st, testExport(8192),
++		Timeouts{Read: 200 * time.Millisecond, Write: 5 * time.Second, Idle: 5 * time.Second})
++	server, client := pipe(t)
++	done := serveConn(h, server)
++	completeHandshake(t, client, testExportName)
++
++	// Four bytes of the 28-byte header, then silence.
++	if _, err := client.Write([]byte{0x25, 0x60, 0x95, 0x13}); err != nil {
++		t.Fatalf("write partial header: %v", err)
++	}
++
++	select {
++	case err := <-done:
++		if err == nil {
++			t.Fatal("serve returned nil after a partial header; a stalled client must end the connection")
++		}
++	case <-time.After(2 * time.Second):
++		t.Fatal("serve did not return within 2s of a 200ms read timeout")
++	}
++	assertNoPayload(t, client, 100*time.Millisecond)
++}
++
++func TestMapError_ClassifiesStoreAndContextErrors(t *testing.T) {
++	tests := []struct {
++		name string
++		err  error
++		want NBDError
++	}{
++		{"nil", nil, 0},
++		{"store closed", engine.ErrStoreClosed, ErrEIO},
++		{"not durable yet", common.ErrNotDurableYet, ErrEIO},
++		{"no space", &merrs.StoreError{Code: merrs.ErrNoSpace, Message: "full"}, ErrENOSPC},
++		{"permission denied", &merrs.StoreError{Code: merrs.ErrPermissionDenied, Message: "nope"}, ErrEPERM},
++		// A RAW sentinel, not an already-wrapped StoreError: this case is what
++		// makes normalization load-bearing. ClassifyBlockStoreError maps
++		// journal.ErrLocalStoreFull to the no-space code, and the only thing
++		// that turns that raw error into a *merrs.StoreError is
++		// NormalizeBlockStoreError. Drop that call and this case collapses to
++		// ErrEIO, which is the disk-full-reports-as-I/O bug the mapping exists
++		// to prevent.
++		{"raw local store full", journal.ErrLocalStoreFull, ErrENOSPC},
++		{"wrapped raw local store full", fmt.Errorf("write: %w", journal.ErrLocalStoreFull), ErrENOSPC},
++		{"canceled", context.Canceled, ErrESHUTDOWN},
++		{"deadline exceeded", context.DeadlineExceeded, ErrESHUTDOWN},
++		{"opaque", errors.New("opaque engine fault"), ErrEIO},
++		{"wrapped store closed", fmt.Errorf("read: %w", engine.ErrStoreClosed), ErrEIO},
++		{"wrapped no space", fmt.Errorf("write: %w", &merrs.StoreError{Code: merrs.ErrNoSpace}), ErrENOSPC},
++		// A store failure wrapped in a cancellation must report the store
++		// failure: the operator needs to know the store is gone, not that a
++		// context expired.
++		{"store closed under a canceled context", fmt.Errorf("op: %w (%w)", engine.ErrStoreClosed, context.Canceled), ErrEIO},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			if got := mapError(tt.err); got != tt.want {
++				t.Fatalf("mapError(%v) = %d, want %d", tt.err, got, uint32(tt.want))
++			}
++		})
++	}
++}
++
++// The auth context is built per command from the configured synthetic identity
++// and the export's read-only ceiling. It is never cached: it embeds the
++// command's context, so a cached one would carry the first command's deadline
++// and cancellation into every later command on the connection.
++func TestHandler_AuthContextCarriesIdentityAndReadOnlyCeiling(t *testing.T) {
++	h := NewHandler(exporterFor(testExport(8192)), resolverFor(newStoreFake()), nil,
++		Identity{UID: 1234, GID: 5678}, testTimeouts(), func() bool { return false })
++
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	authCtx := h.authContext(ctx, &Export{ReadOnly: true})
++	if authCtx.Context != ctx {
++		t.Fatal("auth context does not carry the command's context")
++	}
++	if authCtx.Identity == nil || authCtx.Identity.UID == nil || authCtx.Identity.GID == nil {
++		t.Fatal("auth context has no identity")
++	}
++	if *authCtx.Identity.UID != 1234 || *authCtx.Identity.GID != 5678 {
++		t.Fatalf("auth context identity = %d/%d, want 1234/5678", *authCtx.Identity.UID, *authCtx.Identity.GID)
++	}
++	if !authCtx.ShareReadOnly {
++		t.Fatal("auth context does not apply the export's read-only ceiling")
++	}
++
++	// A second call must not share the first one's identity pointers.
++	other := h.authContext(context.Background(), &Export{})
++	if other.Identity.UID == authCtx.Identity.UID {
++		t.Fatal("two auth contexts share one identity pointer")
++	}
++	if other.ShareReadOnly {
++		t.Fatal("a writable export produced a read-only auth context")
++	}
++}
+diff --git a/internal/adapter/nbd/handlers_read.go b/internal/adapter/nbd/handlers_read.go
+new file mode 100644
+index 00000000..4b0f924c
+--- /dev/null
++++ b/internal/adapter/nbd/handlers_read.go
+@@ -0,0 +1,88 @@
++package nbd
++
++import (
++	"context"
++	"math"
++	"net"
++
++	"github.com/marmos91/dittofs/internal/adapter/common"
++)
++
++// handleRead serves one NBD_CMD_READ.
++//
++// The checks run in this order — overflow, zero length, past the end, flags —
++// because a request that is both malformed and out of range must fail on the
++// malformation: the range check reads the request's own fields, so it cannot be
++// trusted until they have been shown to make sense.
++func (h *Handler) handleRead(ctx context.Context, bs BlockStore, exp *Export, req *Request, conn net.Conn) error {
++	// A client-supplied offset and length can overflow. The check is a
++	// subtraction rather than `req.Offset+uint64(req.Length) > exp.Size`,
++	// because that add wraps and lets a request that is far past the end look
++	// like it starts inside the export.
++	//
++	// decision: the answer is NBD_EIO, not NBD_EOVERFLOW. The spec reserves
++	// EOVERFLOW for READ with NBD_CMD_FLAG_DF and for a payload-less request
++	// over an advertised maximum, and the adapter advertises neither. The
++	// request is not out of range; it cannot be interpreted at all.
++	if uint64(req.Length) > math.MaxUint64-req.Offset {
++		if err := h.writeReply(conn, req.Cookie, ErrEIO, nil); err != nil {
++			return err
++		}
++		return nil
++	}
++
++	// The spec declines to specify a zero-length read beyond "SHOULD NOT
++	// disconnect". One uniform answer is chosen over a per-command table
++	// because no correct client sends one and the connection stays usable.
++	if req.Length == 0 {
++		if err := h.writeReply(conn, req.Cookie, ErrEINVAL, nil); err != nil {
++			return err
++		}
++		return nil
++	}
++
++	// The last byte of the device is addressable, so the range is out of bounds
++	// only when offset+length exceeds the size. A read that ends exactly at the
++	// end is served.
++	if req.Offset+uint64(req.Length) > exp.Size {
++		if err := h.writeReply(conn, req.Cookie, ErrEINVAL, nil); err != nil {
++			return err
++		}
++		return nil
++	}
++
++	// Flags are validated before the store is touched, so a malformed request
++	// never reaches it.
++	//
++	// FUA is accepted and ignored: the spec requires the server to accept it on
++	// every command once SEND_FUA is advertised ("the server MUST accept all
++	// commands with this bit set (even by ignoring the bit)") and notes that
++	// existing clients set it on commands other than WRITE. A read writes
++	// nothing, so there is nothing to persist. Every other flag is gated behind
++	// an advertisement the adapter does not make.
++	if req.Flags&^FlagFUA != 0 {
++		if err := h.writeReply(conn, req.Cookie, ErrEINVAL, nil); err != nil {
++			return err
++		}
++		return nil
++	}
++
++	// Allocated only after the bounds checks: a client that sends
++	// Length: 0xffffffff against a small export gets NBD_EINVAL without a
++	// multi-gigabyte allocation.
++	buf := make([]byte, req.Length)
++
++	// The deadline wrapper is applied per command, not per connection: a
++	// connection is long-lived, so a connection-wide budget would expire a boot
++	// disk mid-boot. It is a no-op when the context already carries a deadline.
++	readCtx, cancel := common.WithRequestDeadline(ctx)
++	defer cancel()
++
++	if _, err := bs.ReadAt(readCtx, string(exp.PayloadID), buf, req.Offset); err != nil {
++		// No payload on the error path: the reply shape for a failed READ is the
++		// header alone.
++		return h.writeReply(conn, req.Cookie, mapError(err), nil)
++	}
++
++	return h.writeReply(conn, req.Cookie, 0, buf)
++}
+diff --git a/internal/adapter/nbd/integration_test.go b/internal/adapter/nbd/integration_test.go
+new file mode 100644
+index 00000000..92d68f34
+--- /dev/null
++++ b/internal/adapter/nbd/integration_test.go
+@@ -0,0 +1,214 @@
++package nbd
++
++import (
++	"bytes"
++	"context"
++	"testing"
++
++	"github.com/marmos91/dittofs/internal/adapter/common"
++	"github.com/marmos91/dittofs/internal/adapter/testruntime"
++	"github.com/marmos91/dittofs/pkg/block/engine"
++	"github.com/marmos91/dittofs/pkg/controlplane/models"
++	"github.com/marmos91/dittofs/pkg/controlplane/runtime"
++	"github.com/marmos91/dittofs/pkg/metadata"
++	"github.com/marmos91/dittofs/pkg/metadata/store/badger/badgertest"
++)
++
++// integrationShare is the share the fixture creates, and integrationVolume the
++// volume inside it, so the export name a client asks for is
++// integrationShare + "/" + integrationVolume.
++const (
++	integrationShare  = "/export"
++	integrationVolume = "boot"
++)
++
++// integrationExportName is the name the handler's exporter resolves.
++const integrationExportName = integrationShare + "/" + integrationVolume
++
++// newIntegrationFixture builds a runtime with one enabled share holding one
++// volume file, and returns the runtime, the export name, and the share's real
++// block store.
++//
++// The journal root comes from testruntime.New, so the local tier is an fs
++// store — which is what makes LocalDurable() true and the eviction assertions
++// below meaningful.
++func newIntegrationFixture(t *testing.T) (*runtime.Runtime, string, *engine.Store) {
++	t.Helper()
++	rt, bsID := testruntime.NewWithShareStore(t)
++	store := badgertest.NewInMemory(t)
++	if err := rt.RegisterMetadataStore("nbd-meta", store); err != nil {
++		t.Fatal(err)
++	}
++	// Enabled: true is load-bearing. AddShare copies the flag verbatim and
++	// nothing defaults it, so a share built without it is disabled — and the
++	// exporter refuses to resolve a disabled share, which would fail every test
++	// here with an ErrUnknownExport that names nothing about the real cause.
++	if err := rt.AddShare(context.Background(), &runtime.ShareConfig{
++		Name: integrationShare, MetadataStore: "nbd-meta", BlockStoreID: bsID,
++		Enabled:           true,
++		DefaultPermission: string(models.PermissionReadWrite),
++		RootAttr:          &metadata.FileAttr{UID: 1000, GID: 1000},
++	}); err != nil {
++		t.Fatal(err)
++	}
++
++	root, err := rt.GetRootHandle(integrationShare)
++	if err != nil {
++		t.Fatal(err)
++	}
++	metaSvc := rt.GetMetadataService()
++	authCtx := &metadata.AuthContext{
++		Context:  context.Background(),
++		Identity: &metadata.Identity{UID: ptr(uint32(1000)), GID: ptr(uint32(1000))},
++	}
++	vols, _, err := metaSvc.CreateDirectory(authCtx, root, "volumes", &metadata.FileAttr{Mode: 0o755})
++	if err != nil {
++		t.Fatal(err)
++	}
++	volsHandle, err := metadata.EncodeFileHandle(vols)
++	if err != nil {
++		t.Fatal(err)
++	}
++	created, _, err := metaSvc.CreateFile(authCtx, volsHandle, integrationVolume, &metadata.FileAttr{Mode: 0o644})
++	if err != nil {
++		t.Fatal(err)
++	}
++	createdHandle, err := metadata.EncodeFileHandle(created)
++	if err != nil {
++		t.Fatal(err)
++	}
++	// Creation zeroes the size, so the export size is set explicitly: it is
++	// fixed at creation and the handler bounds-checks against it.
++	if _, err := metaSvc.SetFileAttributes(authCtx, createdHandle, &metadata.SetAttrs{Size: ptr(uint64(1 << 20))}); err != nil {
++		t.Fatal(err)
++	}
++
++	bs, err := rt.GetBlockStoreForShare(integrationShare)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return rt, integrationExportName, bs
++}
++
++// integrationHandler builds the handler the way the adapter does: the real
++// runtime exporter, and a store resolver wrapping common.ResolveForWrite.
++func integrationHandler(rt *runtime.Runtime) *Handler {
++	id := Identity{UID: 65534, GID: 65534}
++	resolver := func(ctx context.Context, exp *Export) (BlockStore, error) {
++		return common.ResolveForWrite(ctx, rt, exp.Handle)
++	}
++	return NewHandler(NewRuntimeExporter(rt, id), resolver, rt.GetMetadataService(),
++		id, testTimeouts(), func() bool { return false })
++}
++
++// readThroughHandler drives one READ over the wire and returns the reply header
++// and payload.
++func readThroughHandler(t *testing.T, h *Handler, offset uint64, length uint32) (*Reply, []byte) {
++	t.Helper()
++	server, client := pipe(t)
++	serveConn(h, server)
++	completeHandshake(t, client, integrationExportName)
++	return readReplyAndPayload(t, client, &Request{
++		Type: CmdRead, Cookie: 42, Offset: offset, Length: length,
++	})
++}
++
++// TestIntegration_ReadAfterWriteOverRealStore is the end-to-end path over a
++// real engine.Store: bytes written into the volume come back byte-exact through
++// the handler's READ.
++func TestIntegration_ReadAfterWriteOverRealStore(t *testing.T) {
++	rt, _, bs := newIntegrationFixture(t)
++	h := integrationHandler(rt)
++
++	const size = 64 << 10
++	want := make([]byte, size)
++	for i := range want {
++		// Non-zero throughout, so a read that returns zeros fails rather than
++		// matching an unwritten range.
++		want[i] = byte(i%251) + 1
++	}
++	ctx := context.Background()
++	if _, err := bs.WriteAt(ctx, integrationPayloadID(t, rt), nil, want, 0); err != nil {
++		t.Fatalf("WriteAt: %v", err)
++	}
++
++	rep, got := readThroughHandler(t, h, 0, size)
++	if rep.Error != 0 {
++		t.Fatalf("READ reply error = %d, want 0", rep.Error)
++	}
++	if !bytes.Equal(got, want) {
++		t.Fatalf("READ returned %d bytes that do not match what was written", len(got))
++	}
++}
++
++// TestIntegration_ReadEvictedButManifestCoveredRange pins the hydrate path: a
++// range whose bytes have been evicted locally but are covered by the manifest
++// must read back real bytes, not zeros and not an error.
++func TestIntegration_ReadEvictedButManifestCoveredRange(t *testing.T) {
++	rt, _, bs := newIntegrationFixture(t)
++	h := integrationHandler(rt)
++
++	const size = 64 << 10
++	want := make([]byte, size)
++	for i := range want {
++		want[i] = byte(i%251) + 1
++	}
++	ctx := context.Background()
++	payloadID := integrationPayloadID(t, rt)
++	if _, err := bs.WriteAt(ctx, payloadID, nil, want, 0); err != nil {
++		t.Fatalf("WriteAt: %v", err)
++	}
++
++	// DrainAllUploads is what makes the bytes evictable: it force-flushes every
++	// dirty range to the remote and waits for the uploads to settle. Flush alone
++	// is not enough — with a durable local store and no strict enforcement it
++	// returns early without draining the remote, so the bytes stay dirty and
++	// journal.Evict skips any segment holding a dirty record.
++	if err := bs.DrainAllUploads(ctx); err != nil {
++		t.Fatalf("DrainAllUploads: %v", err)
++	}
++	ev, err := bs.DrainLocalSynced(ctx)
++	if err != nil {
++		t.Fatalf("DrainLocalSynced: %v", err)
++	}
++	// This assertion is the test's reason for existing: without it a fixture
++	// change that keeps the bytes local turns this into a test that passes while
++	// proving nothing.
++	if ev.SegmentsEvicted == 0 {
++		t.Fatalf("nothing was evicted, so this test cannot exercise the hydrate path: %+v", ev)
++	}
++
++	rep, got := readThroughHandler(t, h, 0, size)
++	if rep.Error != 0 {
++		t.Fatalf("READ of an evicted range returned error %d, want 0", rep.Error)
++	}
++	if !bytes.Equal(got, want) {
++		t.Fatal("READ of an evicted but manifest-covered range did not return the written bytes")
++	}
++}
++
++// TestIntegration_ReadNeverWrittenRangeIsZeros pins the engine's hole contract:
++// a range inside the export with no write ever reads as zeros, not as an error.
++func TestIntegration_ReadNeverWrittenRangeIsZeros(t *testing.T) {
++	rt, _, _ := newIntegrationFixture(t)
++	h := integrationHandler(rt)
++
++	rep, got := readThroughHandler(t, h, 0, 4096)
++	if rep.Error != 0 {
++		t.Fatalf("READ of an unwritten range returned error %d, want 0", rep.Error)
++	}
++	if !bytes.Equal(got, make([]byte, 4096)) {
++		t.Fatal("READ of an unwritten range did not return zeros")
++	}
++}
++
++// integrationPayloadID resolves the volume's payload ID the way the handler
++// does, through the exporter, so the test writes where the handler reads.
++func integrationPayloadID(t *testing.T, rt *runtime.Runtime) string {
++	t.Helper()
++	exp, err := NewRuntimeExporter(rt, Identity{UID: 65534, GID: 65534}).Resolve(context.Background(), integrationExportName)
++	if err != nil {
++		t.Fatalf("Resolve: %v", err)
++	}
++	return string(exp.PayloadID)
++}
+diff --git a/internal/adapter/nbd/reply.go b/internal/adapter/nbd/reply.go
+index 15dee0ec..515af85c 100644
+--- a/internal/adapter/nbd/reply.go
++++ b/internal/adapter/nbd/reply.go
+@@ -29,20 +29,14 @@ func writeOptionReply(w io.Writer, opt Option, typ OptionReplyType, data []byte)
+ // decision: the error type is a parameter rather than one function per error
+ // value. Six near-identical functions is six places to transpose a magic, and
+ // the reply the client acts on is the type field, not the name of the Go
+ // function that wrote it.
+ func writeOptionError(w io.Writer, opt Option, typ OptionReplyType) error {
+ 	return writeOptionReply(w, opt, typ, nil)
+ }
+ 
+ // writeSimpleReply writes a transmission-phase reply header with no payload,
+ // which is how every command except READ and BLOCK_STATUS answers.
+-//
+-// The transmission phase is where the first caller lives; this is declared here
+-// because the reply helpers belong together, not because the handshake sends
+-// one.
+-//
+-//nolint:unused // first caller is the transmission-phase dispatcher
+ func writeSimpleReply(w io.Writer, cookie uint64, nbdErr NBDError) error {
+ 	r := &Reply{Magic: simpleReplyMagic, Error: nbdErr, Cookie: cookie}
+ 	return r.Encode(w)
+ }
+diff --git a/internal/adapter/nfs/v4/handlers/content_errmap_wiring_test.go b/internal/adapter/nfs/v4/handlers/content_errmap_wiring_test.go
+index e2bb7bfe..5116cc29 100644
+--- a/internal/adapter/nfs/v4/handlers/content_errmap_wiring_test.go
++++ b/internal/adapter/nfs/v4/handlers/content_errmap_wiring_test.go
+@@ -7,21 +7,21 @@ import (
+ 	"time"
+ 
+ 	"github.com/marmos91/dittofs/internal/adapter/common"
+ 	nfs4types "github.com/marmos91/dittofs/internal/adapter/nfs/v4/types"
+ 	"github.com/marmos91/dittofs/pkg/block"
+ 	"github.com/marmos91/dittofs/pkg/block/engine"
+ )
+ 
+ // The block store was closed under an in-flight op (share removed/hot-reloaded
+ // mid-transfer): the reply must draw NFS4ERR_STALE via the payload choke
+-// point's normalization (normalizeBlockStoreError in internal/adapter/common),
++// point's normalization (NormalizeBlockStoreError in internal/adapter/common),
+ // not the literal NFS4ERR_IO the handlers used to return. Each test
+ // closes the per-share store after setup, then drives the handler and asserts
+ // the wire status.
+ 
+ // mapperBoundary pins the seam this wiring depends on: the block-store
+ // classifier (common.ClassifyBlockStoreError) keeps the established
+ // classification (unknown/sentinel → I/O row) while lifting ErrStoreClosed to
+ // the stale-handle row. The general error path (types.StatusForErr on a raw
+ // non-StoreError) defaults to NFS4ERR_SERVERFAULT — which is why the
+ // classifier exists and the handlers route block errors through it.
+diff --git a/pkg/adapter/nbd/adapter.go b/pkg/adapter/nbd/adapter.go
+index 34cba7e6..7cdc49d4 100644
+--- a/pkg/adapter/nbd/adapter.go
++++ b/pkg/adapter/nbd/adapter.go
+@@ -1,19 +1,21 @@
+ package nbd
+ 
+ import (
+ 	"context"
+ 	"errors"
+ 	"fmt"
+-	"io"
+ 	"net"
++	"sync/atomic"
+ 
++	"github.com/marmos91/dittofs/internal/adapter/common"
++	nbd "github.com/marmos91/dittofs/internal/adapter/nbd"
+ 	"github.com/marmos91/dittofs/pkg/adapter"
+ 	"github.com/marmos91/dittofs/pkg/controlplane/runtime"
+ 	"github.com/marmos91/dittofs/pkg/netutil"
+ )
+ 
+ // Adapter serves NBD exports out of a DittoFS share. A guest's kernel NBD
+ // client attaches to the adapter's port, names an export of the form
+ // <share>/<volume>, and reads and writes that volume's bytes.
+ //
+ // It embeds [adapter.BaseAdapter] for the TCP lifecycle and adds the two
+@@ -24,20 +26,30 @@ type Adapter struct {
+ 	*adapter.BaseAdapter
+ 
+ 	// config is the resolved configuration. New applies the defaults before
+ 	// storing it, so every read here sees a complete config.
+ 	config Config
+ 
+ 	// runtime is the control-plane runtime that resolves export names to
+ 	// shares. Set by SetRuntime before Serve, which refuses to start without
+ 	// it.
+ 	runtime *runtime.Runtime
++
++	// handler is built once in Serve, before the listener exists, and read by
++	// NewConnection and Healthcheck — both of which run on other goroutines.
++	// An atomic pointer, not a plain field: Serve runs in its own goroutine
++	// (pkg/controlplane/runtime/adapters/service.go:611) while Healthcheck is
++	// reached from an HTTP handler
++	// (internal/controlplane/api/handlers/adapters.go:240) via
++	// Runtime.AdapterChecker, so a plain field is a data race the race detector
++	// reports on any probe that lands during startup.
++	handler atomic.Pointer[nbd.Handler]
+ }
+ 
+ // New returns an adapter for config with the defaults applied.
+ //
+ // It panics on an invalid configuration, matching the other adapters: the
+ // values come from the operator's config file and the control-plane row, and
+ // models.AdapterConfig.Validate rejects the same ranges before an adapter is
+ // built, so an invalid value reaching this constructor is a programming error
+ // rather than something a client can provoke.
+ func New(config Config) *Adapter {
+@@ -93,61 +105,56 @@ func (a *Adapter) Serve(ctx context.Context) error {
+ 		return fmt.Errorf("nbd: refusing to bind %q without allow_remote_bind: "+
+ 			"NBD has no authentication and no per-path scoping, so a remotely "+
+ 			"reachable export hands every byte of the volume to anyone who can "+
+ 			"reach the port", a.config.BindAddress)
+ 	}
+ 
+ 	if a.runtime == nil {
+ 		return errors.New("nbd: SetRuntime was not called before Serve")
+ 	}
+ 
++	// The wire handler is built once, before the listener exists, so a bad
++	// configuration fails as a startup error rather than as a failed first
++	// connection.
++	id := nbd.Identity{UID: a.config.UID, GID: a.config.GID}
++	exporter := nbd.NewRuntimeExporter(a.runtime, id)
++	// The store resolver wraps common.ResolveForWrite rather than reimplementing
++	// resolution, so the wire layer holds a function and never the runtime. It
++	// returns *engine.Store as nbd.BlockStore implicitly.
++	resolver := func(ctx context.Context, exp *nbd.Export) (nbd.BlockStore, error) {
++		return common.ResolveForWrite(ctx, a.runtime, exp.Handle)
++	}
++	// draining reads the base adapter's shutdown signal rather than keeping a
++	// flag of its own, so the two can never disagree. Shutdown is a promoted
++	// field on the embedded base adapter, so the selector is redundant.
++	draining := func() bool {
++		select {
++		case <-a.Shutdown:
++			return true
++		default:
++			return false
++		}
++	}
++	a.handler.Store(nbd.NewHandler(exporter, resolver, a.runtime.GetMetadataService(),
++		id, a.config.timeouts(), draining))
++
+ 	return a.ServeWithFactory(ctx, a, nil, nil)
+ }
+ 
+ // Stop initiates graceful shutdown and waits for in-flight connections to
+ // drain. It is safe to call more than once: the base adapter's shutdown is
+ // guarded by a sync.Once, so a repeat call only waits for the drain the first
+ // one started.
+ func (a *Adapter) Stop(ctx context.Context) error {
+ 	return a.BaseAdapter.Stop(ctx)
+ }
+ 
+ // NewConnection returns the handler for one accepted TCP connection. It
+ // implements [adapter.ConnectionFactory].
+-func (a *Adapter) NewConnection(conn net.Conn) adapter.ConnectionHandler {
+-	return &nbdConn{conn: conn}
+-}
+-
+-// nbdGreeting is the 18-byte server greeting: the NBDMAGIC and IHAVEOPT magics
+-// followed by the handshake flag word (fixed-newstyle | no-zeroes).
+ //
+-// The wire layer writes the same bytes in its own writeGreeting, which is
+-// unexported; a placeholder is not a reason to widen that package's API, so
+-// the bytes are restated here and go away with the placeholder.
+-var nbdGreeting = []byte{
+-	'N', 'B', 'D', 'M', 'A', 'G', 'I', 'C',
+-	'I', 'H', 'A', 'V', 'E', 'O', 'P', 'T',
+-	0x00, 0x03,
+-}
+-
+-// nbdConn is a placeholder connection handler: it greets the client, drains
+-// whatever the client sends, and closes. It serves no commands.
+-//
+-// decision: this exists only so the adapter lifecycle is exercisable end to
+-// end before the wire layer is wired in — the accept path, the per-connection
+-// goroutine, and the shutdown drain are all shared with the real handler, and
+-// the real handler replaces this type without changing any of them.
+-type nbdConn struct {
+-	conn net.Conn
+-}
+-
+-// Serve greets the client and then waits for it to hang up. The base adapter
+-// interrupts the blocking read on shutdown, so the drain does not outlive the
+-// adapter.
+-func (c *nbdConn) Serve(_ context.Context) {
+-	defer func() { _ = c.conn.Close() }()
+-
+-	if _, err := c.conn.Write(nbdGreeting); err != nil {
+-		return
+-	}
+-	_, _ = io.Copy(io.Discard, c.conn)
++// The socket is bound here rather than on the shared handler because
++// [adapter.ConnectionHandler.Serve] takes only a context; the handler itself is
++// shared and stateless, so the wrapper carries nothing but the socket and the
++// handler pointer.
++func (a *Adapter) NewConnection(conn net.Conn) adapter.ConnectionHandler {
++	return nbd.NewConn(a.handler.Load(), conn)
+ }
+diff --git a/pkg/adapter/nbd/config.go b/pkg/adapter/nbd/config.go
+index 552b4bc2..8fca6dd1 100644
+--- a/pkg/adapter/nbd/config.go
++++ b/pkg/adapter/nbd/config.go
+@@ -1,15 +1,17 @@
+ package nbd
+ 
+ import (
+ 	"fmt"
+ 	"time"
++
++	nbd "github.com/marmos91/dittofs/internal/adapter/nbd"
+ )
+ 
+ // DefaultPort is the port the NBD adapter binds when none is configured. It is
+ // the port the kernel NBD client's documentation uses for a userspace server;
+ // the protocol itself has no assigned port.
+ const DefaultPort = 10809
+ 
+ // DefaultMaxMessageSize is the default cap on a single NBD request payload.
+ // The wire layer's maximum block size is 32 MiB (the largest the adapter
+ // advertises in its block-size information reply), so anything larger than
+@@ -129,10 +131,18 @@ func (c *Config) applyDefaults() {
+ // built. It has exactly one caller, New, which runs applyDefaults immediately
+ // before it, so a port here is always in range or too large: applyDefaults
+ // rewrites anything <= 0 to DefaultPort, which makes a negative port
+ // unreachable rather than merely unlikely.
+ func (c *Config) validate() error {
+ 	if c.Port > 65535 {
+ 		return fmt.Errorf("invalid port %d: must be 0-65535", c.Port)
+ 	}
+ 	return nil
+ }
++
++// timeouts narrows the adapter's four configured durations to the three the
++// wire layer needs. Shutdown is deliberately not here: the base adapter owns
++// the drain deadline, and the handler's job during drain is to answer
++// ErrESHUTDOWN, not to run its own timer.
++func (c *Config) timeouts() nbd.Timeouts {
++	return nbd.Timeouts{Read: c.Timeouts.Read, Write: c.Timeouts.Write, Idle: c.Timeouts.Idle}
++}
+diff --git a/pkg/adapter/nbd/healthcheck.go b/pkg/adapter/nbd/healthcheck.go
+index e7b5ee20..b1552d42 100644
+--- a/pkg/adapter/nbd/healthcheck.go
++++ b/pkg/adapter/nbd/healthcheck.go
+@@ -1,30 +1,43 @@
+ package nbd
+ 
+ import (
+ 	"context"
++	"fmt"
+ 	"time"
+ 
+ 	"github.com/marmos91/dittofs/pkg/health"
+ )
+ 
+ // Healthcheck reports the adapter's health.
+ //
+ //   - A disabled adapter reports [health.StatusDisabled]: it was turned off
+ //     deliberately, so there is nothing to probe.
++//   - A serving adapter reports [health.StatusDegraded] when export or
++//     block-store resolutions have failed since the previous probe. The count
++//     is read-and-reset, so it describes the window since that probe rather
++//     than the adapter's lifetime.
+ //   - Otherwise the base adapter's derivation applies: unknown before the
+ //     listener is bound, unhealthy once shutdown has been initiated and Serve
+ //     has not yet returned, healthy while running.
+ //
+-// No error instrumentation is tracked yet, so a running NBD adapter always
+-// reports healthy; there is nothing that can degrade until export resolution
+-// starts counting its failures.
++// The Degraded branch must come before the delegation, because the base adapter
++// has no way to know about a counter it does not own.
+ func (a *Adapter) Healthcheck(ctx context.Context) health.Report {
+ 	if !a.config.Enabled {
+ 		return health.Report{
+ 			Status:    health.StatusDisabled,
+ 			Message:   "NBD adapter is disabled in config",
+ 			CheckedAt: time.Now().UTC(),
+ 		}
+ 	}
++	if h := a.handler.Load(); h != nil {
++		if n := h.TakeDegraded(); n > 0 {
++			return health.Report{
++				Status:    health.StatusDegraded,
++				Message:   fmt.Sprintf("NBD adapter is serving but %d export resolutions have failed", n),
++				CheckedAt: time.Now().UTC(),
++			}
++		}
++	}
+ 	return a.BaseAdapter.Healthcheck(ctx)
+ }
+diff --git a/pkg/adapter/nbd/healthcheck_test.go b/pkg/adapter/nbd/healthcheck_test.go
+index e8457709..45bbce2a 100644
+--- a/pkg/adapter/nbd/healthcheck_test.go
++++ b/pkg/adapter/nbd/healthcheck_test.go
+@@ -1,15 +1,16 @@
+ package nbd_test
+ 
+ import (
+ 	"context"
+ 	"testing"
++	"time"
+ 
+ 	"github.com/marmos91/dittofs/pkg/adapter/nbd"
+ 	"github.com/marmos91/dittofs/pkg/health"
+ )
+ 
+ func TestNBDAdapter_Healthcheck_DisabledWhenConfigOff(t *testing.T) {
+ 	cfg := minimalConfig()
+ 	cfg.Enabled = false
+ 	a := nbd.New(cfg)
+ 
+@@ -25,10 +26,40 @@ func TestNBDAdapter_Healthcheck_DisabledWhenConfigOff(t *testing.T) {
+ func TestNBDAdapter_Healthcheck_UnknownBeforeStart(t *testing.T) {
+ 	a := nbd.New(minimalConfig())
+ 
+ 	rep := a.Healthcheck(context.Background())
+ 	// The base adapter has not been started, so the override delegates and
+ 	// returns unknown.
+ 	if rep.Status != health.StatusUnknown {
+ 		t.Fatalf("enabled but not started: got %q (%q), want unknown", rep.Status, rep.Message)
+ 	}
+ }
++
++// The Degraded branch needs the handler to exist, so this test starts Serve. It
++// does not need a failed resolution: removing the share after the handshake is
++// not reachable from here (see connection_test.go's note), so the count is
++// produced by the only external lever there is — resolving an export that does
++// not exist, which is a handshake failure rather than a store failure and does
++// NOT increment. That is the point: this test pins the OBSERVABLE contract,
++// that a probe with a zero count reports healthy, and leaves the increment to
++// the internal test.
++func TestNBDAdapter_Healthcheck_NotDegradedWithoutFailures(t *testing.T) {
++	cfg := minimalConfig()
++	cfg.Port = freePort(t)
++	a, done := serveWithRuntime(t, cfg)
++	select {
++	case <-a.ListenerReady():
++	case err := <-done:
++		t.Fatalf("Serve returned before the listener was ready: %v", err)
++	case <-time.After(5 * time.Second):
++		t.Fatal("listener was never ready")
++	}
++
++	// A probe must not invent degradation, and TakeDegraded on a fresh handler
++	// must not block or panic.
++	for i := range 2 {
++		rep := a.Healthcheck(context.Background())
++		if rep.Status == health.StatusDegraded {
++			t.Fatalf("probe %d reported degraded with no failures: %q", i+1, rep.Message)
++		}
++	}
++}
