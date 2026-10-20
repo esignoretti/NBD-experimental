@@ -49,7 +49,9 @@ func DefaultPort(adapterType string) int {
 // can actually build: the adapter constructors treat an out-of-range port as a
 // programmer error and panic on it, and the type decides which constructor runs
 // at all, so both have to be refused before a row is persisted or a start is
-// attempted.
+// attempted. An SMB encryption_mode outside the modes the constructor keeps is
+// the same class of error: the constructor panics on it, and a reload that
+// keeps the listen address stores the row without building the adapter.
 func (a *AdapterConfig) Validate() error {
 	// Only the types with a known default port have a constructor in the
 	// adapter factory, so a type without one has no adapter to build.
@@ -59,7 +61,104 @@ func (a *AdapterConfig) Validate() error {
 	if a.Port < 0 || a.Port > 65535 {
 		return fmt.Errorf("invalid port %d: must be 0-65535", a.Port)
 	}
+	if a.Type == "smb" {
+		mode, err := a.smbEncryptionMode()
+		if err != nil {
+			return err
+		}
+		if mode != "" {
+			if err := ValidateSMBEncryptionMode(mode); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
+}
+
+// ValidateSMBEncryptionMode accepts the modes the SMB constructor keeps after
+// it fills an empty mode with "preferred". Empty is not one of them.
+func ValidateSMBEncryptionMode(mode string) error {
+	switch mode {
+	case "disabled", "preferred", "required":
+		return nil
+	default:
+		return fmt.Errorf("invalid encryption_mode %q: must be one of disabled, preferred, required", mode)
+	}
+}
+
+// EffectiveSMBEncryptionMode returns the mode the SMB constructor will run.
+// An unset mode is "preferred". ok is false when the config JSON cannot be
+// read or the encryption object is malformed.
+func (a *AdapterConfig) EffectiveSMBEncryptionMode() (string, bool) {
+	if a == nil || a.Type != "smb" {
+		return "preferred", true
+	}
+	mode, err := a.smbEncryptionMode()
+	if err != nil {
+		return "", false
+	}
+	if mode == "" {
+		return "preferred", true
+	}
+	return mode, true
+}
+
+// smbEncryptionMode reads the encryption mode from the adapter's own config.
+func (a *AdapterConfig) smbEncryptionMode() (string, error) {
+	parsed, err := a.GetConfig()
+	if err != nil {
+		return "", fmt.Errorf("invalid config: %w", err)
+	}
+	return SMBEncryptionMode(parsed)
+}
+
+// SMBEncryptionMode returns the nested encryption.encryption_mode of a parsed
+// SMB adapter config, or "" when the field is absent or null. A non-null
+// encryption value must be an object, encryption_mode must be a string when
+// present, and the object may only contain encryption_mode and
+// allowed_ciphers. A typo or a wrong JSON type would otherwise leave the
+// adapter on preferred. allowed_ciphers is refused unless null or empty: the
+// cipher set is fixed, and a list the server never applies would report
+// success for a restriction that does not happen. It is the one reader of the
+// encryption object: the adapter build and Validate both go through it.
+//
+// decision: a null encryption reads as unset, not as malformed, so rows
+// already stored with it keep starting.
+//
+// decision: unknown keys are refused inside the encryption object only; a
+// misspelled top-level key is still ignored.
+//
+// decision: a null or empty allowed_ciphers reads as unset. Rows that carry
+// either change nothing, so refusing them would take SMB down for no gain.
+func SMBEncryptionMode(parsed map[string]any) (string, error) {
+	raw, present := parsed["encryption"]
+	if !present || raw == nil {
+		return "", nil
+	}
+	enc, ok := raw.(map[string]any)
+	if !ok {
+		return "", fmt.Errorf("encryption must be an object")
+	}
+	for key, value := range enc {
+		switch key {
+		case "encryption_mode":
+		case "allowed_ciphers":
+			if list, isList := value.([]any); value != nil && (!isList || len(list) > 0) {
+				return "", fmt.Errorf("allowed_ciphers cannot be configured: the SMB cipher set is fixed")
+			}
+		default:
+			return "", fmt.Errorf("unknown encryption key %q", key)
+		}
+	}
+	rawMode, present := enc["encryption_mode"]
+	if !present {
+		return "", nil
+	}
+	mode, ok := rawMode.(string)
+	if !ok {
+		return "", fmt.Errorf("encryption_mode must be a string")
+	}
+	return mode, nil
 }
 
 // TableName returns the table name for AdapterConfig.

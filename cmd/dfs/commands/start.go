@@ -950,6 +950,44 @@ func createNFSAdapter(cfg *models.AdapterConfig, kerberosConfig *config.Kerberos
 	return adapter, nil
 }
 
+// applyParsedSMBConfig copies the adapter JSON fields this process honors.
+// Signing was already copied. encryption_mode is documented on the same
+// object and has to be copied too: without it, start stays on the preferred
+// default and there is no way to select required. It is read through the
+// same parser Validate uses, so a malformed encryption object is refused here
+// too instead of starting on preferred.
+//
+// An unknown mode is returned from here. smb.New panics on it, and this
+// string comes from a persisted adapter row. Boot has no recover above the
+// factory, so the row has to be refused as a config error.
+func applyParsedSMBConfig(smbCfg *smb.Config, parsedConfig map[string]any) error {
+	if parsedConfig == nil {
+		return nil
+	}
+	if bindAddr, ok := parsedConfig["bind_address"].(string); ok {
+		smbCfg.BindAddress = bindAddr
+	}
+	if signingCfg, ok := parsedConfig["signing"].(map[string]any); ok {
+		if enabled, ok := signingCfg["enabled"].(bool); ok {
+			smbCfg.Signing.Enabled = &enabled
+		}
+		if required, ok := signingCfg["required"].(bool); ok {
+			smbCfg.Signing.Required = required
+		}
+	}
+	mode, err := models.SMBEncryptionMode(parsedConfig)
+	if err != nil {
+		return err
+	}
+	if mode != "" {
+		if err := smb.ValidateEncryptionMode(mode); err != nil {
+			return err
+		}
+		smbCfg.Encryption.Mode = mode
+	}
+	return nil
+}
+
 func createSMBAdapter(cfg *models.AdapterConfig, kerberosConfig *config.KerberosConfig, nlAuth *netlogon.Authenticator) (runtime.ProtocolAdapter, error) {
 	port := cfg.Port
 	if port == 0 {
@@ -963,18 +1001,8 @@ func createSMBAdapter(cfg *models.AdapterConfig, kerberosConfig *config.Kerberos
 		return nil, fmt.Errorf("failed to parse adapter config: %w", err)
 	}
 
-	if parsedConfig != nil {
-		if bindAddr, ok := parsedConfig["bind_address"].(string); ok {
-			smbCfg.BindAddress = bindAddr
-		}
-		if signingCfg, ok := parsedConfig["signing"].(map[string]any); ok {
-			if enabled, ok := signingCfg["enabled"].(bool); ok {
-				smbCfg.Signing.Enabled = &enabled
-			}
-			if required, ok := signingCfg["required"].(bool); ok {
-				smbCfg.Signing.Required = required
-			}
-		}
+	if err := applyParsedSMBConfig(&smbCfg, parsedConfig); err != nil {
+		return nil, err
 	}
 
 	smbAdapter := smb.New(smbCfg)

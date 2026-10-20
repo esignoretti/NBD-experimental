@@ -82,6 +82,11 @@ postgres-migration/
 k8s/dittofs-operator/Dockerfile.cross
 k8s/dittofs-operator/manager-linux-amd64
 
+# dt's results, the build its shim runs, and the environment commands' state
+test/harness/results/
+test/harness/.bin/
+test/harness/state/
+
 # SMB Conformance test results and local-mode build artifacts
 test/smb-conformance/results/
 test/smb-conformance/ptfconfig-generated/
@@ -109,6 +114,8 @@ graphify-out/
 .tokensave/
 results/
 bench/results/
+# Upstream NFS suites fetched by test/nfs-mount/fetch.sh
+test/nfs-mount/.cache/
 infra/infra
 bench.yaml
 
@@ -121,6 +128,10 @@ docker-compose.override.yml
 # graphify hook copies are machine-local (they embed an absolute interpreter path)
 .githooks/post-commit
 .githooks/post-checkout
+.rfc-png/
+
+# Obsidian vault settings
+.obsidian/
 
 # NBD rig artifacts (test/nbd/fetch-artifacts.sh downloads ~30MB of kernel and
 # modules here). Build outputs, never committed — the recipe reproduces them.
