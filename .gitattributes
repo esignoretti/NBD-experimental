@@ -1,0 +1,11 @@
+# The extracted files keep their upstream paths, so a patch applies 1:1 to
+# DittoFS. These attributes keep line endings stable across platforms for the
+# files that a patch would have to match byte-for-byte.
+*.go   text eol=lf
+*.sh   text eol=lf
+*.md   text eol=lf
+*.yaml text eol=lf
+*.diff text eol=lf
+
+# Review diffs are evidence: never normalize their content.
+docs/sdd/*.diff -text
