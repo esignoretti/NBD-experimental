@@ -2,9 +2,11 @@
 
 An NBD (Network Block Device) adapter for [DittoFS](https://github.com/marmos91/dittofs), extracted for review and merge proposal.
 
-**Status:** feature-complete and working, with two known bugs fixed and two open work items. Never merged upstream. See [Status](#status).
+**Status:** a working prototype. The protocol is implemented end to end and has booted a real kernel from a real export, but it is not production-ready: pipelining is planned and unstarted, there is no CI coverage, and several minor issues are recorded but unfixed. Two bugs found in review are fixed here. Never merged upstream. See [Status](#status).
 
 **This is not a standalone project.** It is an extraction of one feature branch — 77 commits — from the DittoFS repository. Every file sits at its exact upstream path so that the commits apply 1:1 to DittoFS. See [Merging upstream](#merging-upstream).
+
+**What is here and what is not.** The 39 files this branch touches are extracted verbatim; the rest of DittoFS is not included, so this repository does not build on its own and has no `go.mod`. That is deliberate — it is a patch set with documentation, not a fork. `docs/sdd/` is the exception: those artifacts were never tracked upstream (they lived in `.superpowers/`, which DittoFS gitignores), so they are added here under `docs/sdd/` and would not be part of a merge.
 
 ---
 
@@ -161,8 +163,11 @@ test/nbd/                        the proof rigs
 
 docs/superpowers/specs/          the design spec (§1–§13)
 docs/superpowers/plans/          the 8-task implementation plan, and the pipelining plan
-docs/sdd/                        the SDD record: briefs, reports, review diffs, progress ledger
+docs/sdd/                        ⚠ added here, not upstream: the SDD record —
+                                 briefs, reports, review diffs, progress ledger
 ```
+
+Everything above the `docs/sdd/` line exists in DittoFS at that path. `docs/sdd/` does not — see [What is here and what is not](#what-it-does).
 
 ### The ten files outside the adapter
 
