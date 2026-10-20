@@ -124,6 +124,8 @@ go test -race -count=1 (both packages)                   ok 13.4s / ok 3.2s
 go test -run Oracle                                      both PASS
 ```
 
+**And re-verified after merging into v0.36.0**, which is the state a reviewer would actually get — see [Merging upstream](#merging-upstream). `go build ./...` passes, both NBD packages pass, and 51 of 51 adapter packages pass.
+
 **97 test functions** across 9 test files: 3,758 lines of tests against 1,880 lines of production code in `internal/adapter/nbd`, plus 296 against 354 in `pkg/adapter/nbd`. The rig under `test/nbd/` is another 1,973 lines of shell.
 
 ---
@@ -187,14 +189,39 @@ The point of this repository is to make a merge proposal possible, so the histor
 **All 39 files are byte-identical to the original branch.** Verified at extraction, per file:
 
 ```
-$ git ls-tree -r 498a9d9   # the last commit before the review fixes
-$ ...compare each blob against the same path on nbd-on-036
-mismatches: 0 of 39
+$ git ls-tree -r 498a9d9 > new.txt     # last commit before the review fixes
+$ git ls-tree -r nbd-on-036 > orig.txt # the original branch tip
+# compare the blob SHA of every path present in both
+shared: 39, identical: 39, differing: 0
 ```
 
 (Whole-tree hashes necessarily differ — the original branch has 3,305 files and this extraction has the 39 the NBD work touches. What matters for a patch is that every one of those 39 blobs is identical.)
 
-**The history is 77 NBD commits** — the same commits, same authors, same timestamps, same messages, in the same order — replayed onto the DittoFS commit they were originally based on (`62acc10`). Unrelated upstream commits that the extraction would otherwise have carried are dropped; nothing about the NBD work is lost.
+**The history is 77 NBD commits** — the same commits, same authors, same timestamps, same messages, in the same order — replayed onto DittoFS **v0.36.0** (`51fc8443`). Unrelated upstream commits that the extraction would otherwise have carried are dropped; nothing about the NBD work is lost.
+
+**The merge was tested, not assumed.** This is worth being precise about, because the first attempt failed. The branch was originally described as based on `f2183422`, but cherry-picking the range there does **not** compile:
+
+```
+internal/adapter/common/payload_operation.go:31:19:
+    blockStore.WithPayloadScope undefined (type *engine.Store has no field or method WithPayloadScope)
+```
+
+`WithPayloadScope` arrives upstream in `2a3d7f76` (#2958) and is refined by `68946fe3` (#3030), both of which the branch carries and the extraction dropped. The real base is **v0.36.0** (`51fc8443`), which contains both. At that base the range applies with two trivial conflicts:
+
+| Conflict | Resolution |
+|---|---|
+| `.gitignore` | both sides append at EOF; keep both blocks |
+| `internal/adapter/common/payload_operation.go` | `normalizeBlockStoreError` was exported to `NormalizeBlockStoreError` on this branch; take the branch's name |
+
+After resolving those two, all 77 commits land and:
+
+```
+go build ./...                                           PASS
+go test ./internal/adapter/nbd/... ./pkg/adapter/nbd/...  ok 7.3s / ok 1.2s
+go test ./internal/adapter/... ./pkg/adapter/...          51 packages ok, 0 failures
+```
+
+`go test ./...` has two failures, neither from this work: `test/harness/known` fails at the v0.36.0 baseline too (macOS bash 3.2 has no `declare -A`), and `TestBLAKE3FasterThanSHA256` is a load-sensitive benchmark gate on an untouched package (`pkg/block` is not among the 39 changed files) that passes when run alone.
 
 **What changed from the original branch:**
 
@@ -202,24 +229,29 @@ mismatches: 0 of 39
 - Five commits on top: the two fixes above (`89f2e4a`, `69e80b8`), a redaction commit (`e5b8bf2`), the SDD record, and this README.
 - `test/nbd/deploy/config-server2.yaml` had the real deployment's JWT secret and public address; both are redacted.
 - `docs/sdd/` is new here — the SDD artifacts lived in `.superpowers/`, which is gitignored upstream.
+- The 82 commits' author emails were rewritten to a GitHub noreply address; three carried a laptop hostname.
 
 ### To propose the merge
 
 ```bash
-# In a DittoFS clone at the commit this was based on:
+git clone https://github.com/marmos91/dittofs.git
+cd dittofs
+git checkout 51fc8443          # v0.36.0 — the verified base
 git remote add nbd-exp https://github.com/esignoretti/NBD-experimental.git
 git fetch nbd-exp
 
-# Option A: cherry-pick the range (keeps messages and authors)
-git cherry-pick 62acc10..nbd-exp/main
+# 62acc10 is the baseline commit in this repository; the range is the 77 NBD commits.
+git cherry-pick 62acc10..498a9d9
 
-# Option B: merge (preserves the 77-commit history as one merge)
-git merge --no-ff nbd-exp/main
+# Expect the two conflicts above, resolve them as described, then:
+go build ./... && go test ./internal/adapter/nbd/... ./pkg/adapter/nbd/...
 ```
 
-Then re-run the gate. Two things to check that this repository cannot check for you:
+`498a9d9` is the last commit before the review fixes; extend the range to `nbd-exp/main` to take the two fixes and the redaction as well (the README commit will conflict add/add, since DittoFS already has one — skip it).
 
-1. **The ten modified files may have moved on.** The branch was based on `62acc10`; if `write_payload.go` or `start.go` changed since, expect conflicts there. Re-verify each premise — the SDD ledger's own standing hazard is *"audits predate later fixes — re-verify each premise on develop."*
+Two things to check that this repository cannot check for you:
+
+1. **The ten modified files may have moved on.** The merge was verified against `51fc8443`; if `write_payload.go`, `start.go` or `normalize.go` changed after v0.36.0, expect conflicts there. Re-verify each premise — the SDD ledger's own standing hazard is *"audits predate later fixes — re-verify each premise on develop."*
 2. **`crash-restart.sh` still has not run end to end**, and there is still no CI job. Both are worth doing before a merge rather than after.
 
 ---
