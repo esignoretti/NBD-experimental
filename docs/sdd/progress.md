@@ -2103,3 +2103,124 @@ The oracle catches a FLUSH that answers *wrongly* and misses one that answers `0
 **Step 6 gained a refusal requirement:** if the host has no KVM the script must refuse rather than fall back to TCG, because a TCG run boots and passes while every timing in it is meaningless. "Not run: no KVM" is the honest outcome; a green TCG run is worse than no run because it looks like evidence.
 
 **Still unresolved and deliberately left so:** the plan does not pin *how* the harness creates `volumes/boot` (NFS mount + `SetFileAttributes`, vs. any other route). The Step 1 text names the requirement and the size trap and says the operator's own route is the model; the implementer will pick one and the review will judge it. Recorded here so the choice is visible as a choice.
+
+---
+
+## After the branch: the review, the pipelining, and the release cleanup
+
+The ledger above ends where the first phase of work ended. Everything after it was
+driven by a code review of the finished adapter and by measurement, and it is
+recorded here so a reviewer can see what changed after the SDD tasks were closed.
+
+### The review that found two real bugs
+
+A full read of the 14 production files found two defects worth blocking on and
+eight minor ones:
+
+**P0 — a WRITE arriving during drain desynchronized the stream.** The draining
+branch answered `NBD_ESHUTDOWN` without consuming the payload the client had
+already sent, so the next header was parsed out of payload bytes and the
+connection died later with `NBD_EBADMAGIC`. That is the opposite of what the
+drain exists for. Fixed in `89f2e4a`; the regression test
+`TestConnection_DrainingWriteDrainsPayload` was verified to fail without it
+(`read reply: read tcp ...: i/o timeout`).
+
+**P1 — the handshake was unbounded.** `ServeHandshake` armed no deadline and the
+base adapter arms none on an accepted socket, so a client could connect, send
+nothing, and hold a goroutine and a file descriptor forever — before naming an
+export, so before any authorization decision exists to fail. Fixed in `69e80b8`.
+
+The minor items became the release cleanup below.
+
+### Pipelining: the ceiling was dispatch, not the store
+
+The measured shape was the argument. Random 4 KiB reads by queue depth reported
+the same IOPS at depth 8, 16, 32 and 64, because one goroutine read a header,
+handled the command and wrote the reply — the client's queue was only a queue of
+waits. A benchmark that isolated the store from the adapter showed **88% of each
+request was spent waiting on the store**, behind a dispatcher that could not
+overlap anything.
+
+The fix separates the three roles that one loop performed: a reader that is the
+only goroutine to advance the stream (a WRITE's payload is inline, so two readers
+would consume each other's bytes), a pool of workers that call handlers and never
+touch the connection, and a writer that is the only goroutine to write (two
+writers would interleave a header and its payload).
+
+The change was made in two commits on purpose. `ad032e42` introduced the pipeline
+at **one** worker, which reproduces the serial loop exactly — so the entire
+existing suite ran against it unchanged and any behavioural difference would have
+been a refactor bug rather than a tuning question. `a56c7016` then raised the
+worker count and added the byte budget.
+
+Three things the plan had not anticipated, found by building it:
+
+1. **`Conn.Serve`'s `recover` stopped covering the handler.** It only ever
+   protected its own frame, and dispatch left that frame. A panicking handler
+   would have killed the process. The worker now recovers per command and answers
+   that command with `NBD_EIO`, which is strictly better than the old behaviour —
+   the connection survives.
+2. **A real data race in `pkg/metadata`.** `RecordWrite` returned a pointer *into*
+   the pending-writes map; the caller read it after the lock was released. Harmless
+   while dispatch was serialized, a genuine race once it was not. Found by
+   `go test -race`, fixed in `pkg/metadata/pending_writes.go`.
+3. **A FLUSH barrier had to become explicit.** Serialized dispatch gave the
+   ordering guarantee for free. With a pool, a FLUSH can reach a worker while a
+   WRITE is still inside the store, so the reader now waits for the count of
+   submitted-but-uncommitted writes to reach zero before queueing it.
+
+The in-flight budget is over **bytes, not commands**, and it is taken by READ as
+well as WRITE: `handleRead` allocates `req.Length` on the worker, so a
+WRITE-only budget would leave N concurrent READs free to allocate N × 32 MiB with
+the counter untouched.
+
+Measured result, same host, same fixture, serial build against the pipelined one:
+
+| Depth | Before (serial) | After (4 in flight) |
+|---|---|---|
+| 1 | 22,075 | 21,141 |
+| 8 | 39,682 | 51,282 |
+| 16 | 40,160 | 58,139 |
+| 32 | 39,215 | 54,945 |
+| 64 | 38,167 | 51,020 |
+
+The shape is the finding: before, depth bought nothing above 1; after, depth 16 is
+**1.45×** depth 1. Absolute figures on this host vary ±20% between runs and are
+not comparable across machines — see [`docs/nbd-benchmarks.md`](../nbd-benchmarks.md).
+
+A real kernel still boots from the pipelined adapter, and the second boot still
+recovers the filesystem the first one wrote.
+
+### What was closed from the review
+
+| Item | Resolution |
+|---|---|
+| `PunchHole` had no request deadline | fixed — `common.WithRequestDeadline` on the punch |
+| `FLUSH` accepted undocumented flags | fixed — rejects anything but `FUA` |
+| READ honoured no read permission | fixed — `PrepareRead` before the allocation |
+| A short read was reported as success | fixed — `NBD_EIO` |
+| Export size treated as immutable | fixed — re-resolved, bounded by `size_refresh` |
+| `MaxConnections` 0 meant unlimited | fixed — defaults to 64; an uncapped remote bind is refused |
+| UID/GID 0 unexpressible | fixed — `uid_set`/`gid_set`, because every uint32 is a legal uid |
+| `max_message_size`, `default_export` had no consumers | deleted, rather than wired: the advertised maximum and the enforced maximum must be the same number, and only the enforcement was configurable |
+| 10 dead protocol constants + 1 dead codec | deleted |
+| No CI coverage | fixed — four NBD gates pinned in `test/required-tests.json`; the oracle now runs in CI with `qemu-nbd` installed |
+| No benchmark script | fixed — `test/nbd/bench-fio.sh` |
+| Buffer pooling | **still open**, and the byte budget bounds the memory instead |
+
+### Two things this record is careful about
+
+**The oracle's limit.** It catches a FLUSH that answers *wrongly* and misses one
+that answers `0` without doing anything, because `qemu-io flush` prints the same
+line either way. The table under FINDING 3 above is the evidence; do not read the
+oracle as covering the durability path on its own.
+
+**The plan's own errors.** The pipelining plan
+(`docs/superpowers/plans/2026-10-20-nbd-pipelining-and-release-cleanup.md`)
+claimed at first that handlers would stop touching the socket, which would have
+made the reader and `handleWrite` both read the same socket. It also named a
+`CmdDiscard` command that does not exist (`handleDiscard` is a helper called by
+TRIM and WRITE_ZEROES), and put the FLUSH barrier inside `handleFlush`, where it
+would have deadlocked the pool it was part of. All three were corrected before
+execution. Where the plan and the code disagreed during execution, the code won,
+and the difference is recorded in the commit that resolved it.

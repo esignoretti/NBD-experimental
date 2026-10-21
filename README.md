@@ -2,11 +2,11 @@
 
 An NBD (Network Block Device) adapter for [DittoFS](https://github.com/marmos91/dittofs), extracted for review and merge proposal.
 
-**Status:** a working prototype. The protocol is implemented end to end and has booted a real kernel from a real export, but it is not production-ready: pipelining is planned and unstarted, there is no CI coverage, and several minor issues are recorded but unfixed. Two bugs found in review are fixed here, and so is one found by running the crash rig. Never merged upstream. See [Status](#status) and [`docs/nbd-benchmarks.md`](docs/nbd-benchmarks.md).
+**Status:** a working prototype, now pipelined. The protocol is implemented end to end, it has booted a real kernel from a real export, and it serves several commands per connection concurrently — depth 16 measures 1.45× what the serialized dispatcher reached. It is still not production-ready: no CI job runs the kernel-boot rig, and a handful of minors are recorded but unfixed. Five defects found by review and by running the rig are fixed here. Never merged upstream. See [Status](#status) and [`docs/nbd-benchmarks.md`](docs/nbd-benchmarks.md).
 
-**This is not a standalone project.** It is an extraction of one feature branch — 77 commits — from the DittoFS repository. Every file sits at its exact upstream path so that the commits apply 1:1 to DittoFS. See [Merging upstream](#merging-upstream).
+**This is not a standalone project.** It is an extraction of one feature branch — 103 commits — from the DittoFS repository. Every file sits at its exact upstream path so that the commits apply 1:1 to DittoFS. See [Merging upstream](#merging-upstream).
 
-**What is here and what is not.** The 39 files this branch touches are extracted verbatim; the rest of DittoFS is not included, so this repository does not build on its own and has no `go.mod`. That is deliberate — it is a patch set with documentation, not a fork. `docs/sdd/` is the exception: those artifacts were never tracked upstream (they lived in `.superpowers/`, which DittoFS gitignores), so they are added here under `docs/sdd/` and would not be part of a merge.
+**What is here and what is not.** The 53 files this branch touches are extracted verbatim; the rest of DittoFS is not included, so this repository does not build on its own and has no `go.mod`. That is deliberate — it is a patch set with documentation, not a fork. `docs/sdd/` is the exception: those artifacts were never tracked upstream (they lived in `.superpowers/`, which DittoFS gitignores), so they are added here under `docs/sdd/` and would not be part of a merge.
 
 ---
 
@@ -87,54 +87,141 @@ Two bugs found in a full code review and fixed on top of the branch. Both have r
 
 **P1 — the handshake was unbounded.** `ServeHandshake` armed no deadline, the base adapter sets none on an accepted socket, and the dispatch loop's first arm only runs after the handshake returns. A client could connect, send nothing, and hold a goroutine and a file descriptor forever — before naming an export, so before any authorization decision exists to fail. Fixed with a `Timeouts.Read` deadline plus a `ctx` poll in the option loop, so a shutdown also aborts a handshake in progress. Commit `69e80b8`.
 
+### What this branch now does that it did not
+
+**Pipelining — done, and measured.** A connection used to serve one command at a
+time: a single loop read a header, handled the command and wrote the reply. That
+is why the depth sweep was flat from depth 8 — the client's queue was a queue of
+waits. Dispatch is now three roles (`internal/adapter/nbd/pipeline.go`): a reader
+that is the only goroutine advancing the stream, a pool of workers that never touch
+the connection, and a single writer that is the only one writing to it. The split
+is not optional even at one worker — two readers would consume each other's
+payload bytes, two writers would interleave a header and its payload.
+
+| depth | before (serial) | after (`max_in_flight: 4`) |
+|---|---|---|
+| 1 | 22,075 | 21,141 |
+| 8 | 39,682 | 51,282 |
+| 16 | 40,160 | **58,139** |
+| 32 | 39,215 | 54,945 |
+| 64 | 38,167 | 51,020 |
+
+Depth 1 is unchanged, which is the control: one command in flight is one command in
+flight either way. Depth 16 moves 1.45×. The absolute numbers vary 15–20% run to
+run on this host — the **shape** is the finding. A pool of eight measures within
+noise of a pool of four, which is why four is the default.
+
+The plan's premise was partly wrong and the results say so: it predicted
+approaching the ~114,000 IOPS the engine reaches in-process, and the plateau
+landed at ~55,000. The dispatcher was **a** ceiling, not **the** ceiling; the
+store's admission control is next.
+
+`max_in_flight` (default 4, clamped to 64) and `max_in_flight_bytes` (default
+64 MiB) are configurable. The byte budget covers READ as well as WRITE, because
+`handleRead` allocates on the worker — a WRITE-only budget would leave N concurrent
+READs free to allocate N × 32 MiB with the counter untouched.
+
+**FLUSH is a real barrier now.** Its correctness used to rest on serialization:
+a command was handled and replied before the next was read, so every replied write
+had been committed by the time a FLUSH was handled. A pool breaks that argument, so
+the guarantee is explicit — a pending-write counter that FLUSH waits on, before it
+is queued, on the reader goroutine.
+
+### Defects found by running it, not by reading it
+
+**A data race in `pkg/metadata`, reachable only now that dispatch is concurrent.**
+`PendingWritesTracker.RecordWrite` returned a pointer into its own map, which
+`deferredCommitWrite` read after the lock was released. That was safe only while
+every protocol adapter dispatched one command at a time per file — exactly what NBD
+no longer does. It now returns a copy taken under the lock.
+
+**`SetPipelining` was never called.** The handler's fields were read by `serve` and
+written by nobody: the adapter built the handler without them, so every configured
+value was silently replaced by the default. A first benchmark A/B measured the
+default against the default and reported that pipelining changed nothing — true of
+that binary, false of the code.
+
+**A cancelled context never reached the reader.** `ReadRequest` blocks in a syscall
+that context cancellation does not interrupt, so shutdown waited out the idle
+timeout — five minutes. The fix is a read deadline of *now*, not a budget: it is an
+unblock, and a grace period would hold the connection open past the shutdown
+window.
+
+**And a worse one the above exposed:** replies were handed to the writer with a
+plain `select` over `{send, ctx.Done()}`. When both are ready Go picks randomly,
+and during a drain both always are — so roughly half the replies of a draining
+connection were dropped by their own escape hatch and the client got `EOF` where it
+should have got an answer.
+
 ### Open work
 
-**1. Pipelining — planned, not started.** This is the fix for the depth plateau. The design is in `docs/superpowers/plans/2026-10-19-nbd-pipelining.md`: a reader goroutine, a worker pool, a single ordered writer; `MaxInFlight` default 4 / max 64; a `maxInFlightBytes` semaphore; FLUSH as a barrier via `sync.Cond` on a pending counter; handlers changed to return a `reply{cookie, nbdErr, payload}` value instead of writing to the socket themselves. The falsifiable prediction: *depth 32 must exceed depth 8 by a wide margin after the change.*
+**1. `crash-restart.sh` needs a Linux host.** It requires root and an `nbd-client`
+built from `master` — no released version can reconnect. Its first end-to-end run
+found that it waited for the block *node* while `/sys/block/nbdN/size` was still 0,
+so a write failed `ENOSPC` on a healthy export and the script blamed the adapter
+identity. Fixed in `5480f219`; transcripts are in `docs/nbd-benchmarks.md`.
 
-Note that the FLUSH barrier's correctness currently rests on serialization — `handlers_control.go` says so explicitly. Pipelining invalidates that argument and the barrier needs real in-flight tracking.
+**2. One missing artifact.** "The deploy script" is referenced twice in
+`test/nbd/deploy/config-server2.yaml` and does not exist. (`bench-fio.sh`, which
+the pipelining plan cited for months, now exists.)
 
-**2. `crash-restart.sh` passes, and needed a rig fix to get there.** It requires a Linux host with root and an `nbd-client` built from `master` — no released version can reconnect. Its first end-to-end run found that it waited for the block *node* while `/sys/block/nbdN/size` was still 0, so a write failed `ENOSPC` on a healthy export and the script blamed the adapter identity. Fixed in `5480f219`. The test and its negative control both now behave as designed; transcripts are in `docs/nbd-benchmarks.md`.
+**3. The kernel-boot rig is not in CI.** The NBD unit tests and the differential
+oracle now are — `.github/workflows/integration-tests.yml` installs `qemu-utils`
+and runs `test/nbd/run-oracle.sh`, and four NBD gates are pinned in
+`test/required-tests.json`. Booting a VM per pull request is a different cost
+decision and has not been made.
 
-**3. Missing artifacts.** `bench-fio.sh` is cited by the pipelining plan and does not exist. "The deploy script" is referenced twice in `test/nbd/deploy/config-server2.yaml` and does not exist.
-
-**4. No CI coverage.** `nbd` appears in no GitHub workflow and is not in `test/required-tests.json`. Everything above is green locally and enforced nowhere.
-
-**5. The live demo server is not usable for benchmarking.** The same depth sweep against the live S3-backed host reads ~92 IOPS and stays flat, because its local tier is not retaining reads (`hit-ratio: 0.40`, cache life expectancy 2.00 s at p50). That is a cache-configuration finding, not an adapter one — but it needs its own investigation before any number from that host means anything. Detail in `docs/nbd-benchmarks.md` §5.
+**4. The live demo server is not usable for benchmarking.** The same depth sweep
+against the live S3-backed host reads ~92 IOPS and stays flat, because its local
+tier is not retaining reads (`hit-ratio: 0.40`, cache life expectancy 2.00 s at
+p50). That is a cache-configuration finding, not an adapter one — but it needs its
+own investigation before any number from that host means anything. Detail in
+`docs/nbd-benchmarks.md` §5.
 
 ### Known minor issues
 
-Recorded, not fixed. The full list of 14 deferred minors is in `docs/sdd/progress.md`.
+Every item the review recorded is now closed. What remains is one capability
+deliberately refused and one performance opportunity, both explained rather than
+fixed.
 
-| Issue | Where |
+| Item | State |
 |---|---|
-| `max_message_size`, `default_export`, `uid`, `gid`, `timeouts.*` have mapstructure tags but `createNBDAdapter` reads only four keys — the first and second have *zero* consumers anywhere | `pkg/adapter/nbd/config.go` |
-| UID/GID `0` is unexpressible (0 doubles as "unset"), so "run as root" cannot be configured | `config.go:121` |
-| `PunchHole` is the only block-store call without a request deadline | `handlers_write.go:265` |
-| `handleFlush` does not validate flags, unlike every other command | `handlers_control.go:22` |
-| No buffer pooling on READ/WRITE — `make` per command, up to 32 MiB | `handlers_read.go:88` |
-| 10 dead protocol constants, 6 test-only ones, and 1 dead + 4 test-only codec functions | `protocol.go` |
-| `handleRead` ignores the returned `n` (safe today: the journal always fills the buffer on nil error) | `handlers_read.go:96` |
-| No read-permission check on the READ path (write path is checked) | `handlers_read.go` |
-| Export size is a handshake-time snapshot, so a truncate over NFS/SMB is invisible to a live NBD connection | `volume.go:146` |
-| `validate()` only checks the port | `config.go:137` |
+| `max_message_size`, `default_export`, `uid`, `gid`, `timeouts.*` had tags but no reader | **fixed** — `uid`, `gid` and all four `timeouts.*` are read and range-checked; `max_message_size` and `default_export` are **deleted**, because the advertised maximum and the enforced maximum must be the same number and making only the enforcement configurable would be a conformance bug |
+| UID/GID `0` unexpressible | **fixed** — `UIDSet`/`GIDSet` pointers, because every uint32 is a legal UID |
+| `PunchHole` without a request deadline | **fixed** |
+| `handleFlush` did not validate flags | **fixed** |
+| No read-permission check on READ | **fixed**, and a short read is now `EIO` instead of being ignored |
+| 10 dead constants, 6 test-only, 1 dead + 4 test-only codec functions | **deleted** |
+| Export size was a handshake-time snapshot | **fixed** — re-resolved at most once per second (`Handler.sizeRefresh`), so a truncate over NFS/SMB becomes visible |
+| `validate()` only checked the port | **fixed** — also refuses a remote bind with no connection cap, and negative pipelining values |
+| No buffer pooling on READ/WRITE | **open** — the byte budget bounds the memory, but every command still allocates. A pool would need an ownership discipline the pipeline does not have yet |
+| `NBD_CMD_BLOCK_STATUS` | **refused by design** — see [`docs/nbd-block-status.md`](docs/nbd-block-status.md) |
+
 
 ---
 
 ## Health
 
-At the time of extraction, in the parent repository:
+In the parent repository, at the branch tip:
 
 ```
 go build ./...                                          OK
-go vet ./internal/adapter/nbd/... ./pkg/adapter/nbd/...  clean
-gofmt -l                                                 clean
-go test -race -count=1 (both packages)                   ok 13.4s / ok 3.2s
+go vet ./...                                             clean
+gofmt -l (both NBD packages)                             clean
+go test -race -count=1 (both packages)                   ok 14.4s / ok 3.8s
 go test -run Oracle                                      both PASS
+go test -race ./internal/adapter/... ./pkg/adapter/... ./pkg/metadata/...
+                                                         63 packages ok, 0 failures
 ```
 
-**And re-verified after merging into v0.36.0**, which is the state a reviewer would actually get — see [Merging upstream](#merging-upstream). `go build ./...` passes, both NBD packages pass, and 51 of 51 adapter packages pass.
+**And re-verified as a merge into v0.36.0**, which is the state a reviewer would actually get — see [Merging upstream](#merging-upstream). `go build ./...` passes, both NBD packages pass, and 63 of 63 adapter and metadata packages pass.
 
-**97 test functions** across 9 test files: 3,758 lines of tests against 1,880 lines of production code in `internal/adapter/nbd`, plus 296 against 354 in `pkg/adapter/nbd`. The rig under `test/nbd/` is another 1,973 lines of shell.
+**123 test functions and 5 benchmarks** across 16 test files: 4,949 lines of
+tests against 2,768 lines of production code in `internal/adapter/nbd`, plus 502
+against 457 in `pkg/adapter/nbd`. The rig under `test/nbd/` is another 2,257
+lines of shell. (Before this branch's cleanup the split was 97 test functions
+across 9 files, 3,758 test lines against 1,880 production — the production code
+grew by the pipeline and the tests grew faster.)
 
 ---
 
@@ -143,18 +230,20 @@ go test -run Oracle                                      both PASS
 Every path below is where the file lives in DittoFS, unchanged.
 
 ```
-internal/adapter/nbd/           5,638 LOC — the wire layer (1,880 prod + 3,758 test)
+internal/adapter/nbd/           7,717 LOC — the wire layer (2,768 prod + 4,949 test)
   protocol.go                     wire codec: magics, header encode/decode
   handshake.go                    greeting, option haggling, export resolution
-  connection.go                   per-connection dispatch loop, Handler, BlockStore
+  connection.go                   Conn, Handler, BlockStore; serve hands off to pipeline
+  pipeline.go                     reader / worker pool / writer, byte budget, FLUSH barrier
   handlers_read.go                NBD_CMD_READ
   handlers_write.go               NBD_CMD_WRITE, TRIM, WRITE_ZEROES, payload drain
   handlers_control.go             NBD_CMD_FLUSH, the durability barrier
   volume.go                       RuntimeExporter: <share>/<volume> → Export
   payload_size.go                 the advertised-maximum bound
   reply.go                        reply writers
+  reply_value.go                  the reply value handlers return instead of writing
 
-pkg/adapter/nbd/                  650 LOC — the framework side (354 prod + 296 test)
+pkg/adapter/nbd/                  959 LOC — the framework side (457 prod + 502 test)
   adapter.go                      BaseAdapter lifecycle, Serve, NewConnection
   config.go                       Config, defaults, validation
   healthcheck.go                  degraded-export reporting
@@ -163,6 +252,7 @@ test/nbd/                        the proof rigs
   README.md                       32 KB: topology, every command, every finding
   boot-qemu.sh                    40 KB: boots a real kernel from an export
   crash-restart.sh                36 KB: server-down/reconnect (needs Linux+root)
+  bench-fio.sh                    depth sweep, sequential, fsync-per-4KiB
   fetch-artifacts.sh              20 KB: downloads the kernel + nbd.ko
   run-oracle.sh                   differential run against qemu-nbd
   deploy/config-server2.yaml      demo host config, with the memory budget
@@ -177,9 +267,10 @@ docs/sdd/                        ⚠ added here, not upstream: the SDD record �
 
 Everything above the `docs/sdd/` line exists in DittoFS at that path. `docs/sdd/` does not — see [What is here and what is not](#what-it-does). `docs/nbd-benchmarks.md` is also new here, and is deliberately *not* called `BENCHMARKS.md`: upstream has a 588-line `docs/BENCHMARKS.md` comparing DittoFS against JuiceFS and rclone, and on a case-insensitive filesystem (macOS default) the two paths would collide on merge.
 
-### The ten files outside the adapter
+### The files outside the adapter
 
-The adapter is not entirely self-contained. These existing DittoFS files were modified, and they are why a merge needs care:
+The adapter is not entirely self-contained. These existing DittoFS files were
+modified, and they are why a merge needs care:
 
 | File | Change |
 |---|---|
@@ -189,9 +280,22 @@ The adapter is not entirely self-contained. These existing DittoFS files were mo
 | `internal/adapter/common/normalize.go` | `ErrAccessDenied` → `EPERM` mapping |
 | `internal/adapter/common/read_payload.go`, `payload_operation.go`, `doc.go` | shared helpers the NBD handlers reuse |
 | `internal/adapter/nfs/v4/handlers/content_errmap_wiring_test.go` | test adjusted for the shared helper |
+| `pkg/metadata/pending_writes.go` | **a real data race**, exposed by pipelining: `RecordWrite` returned a pointer into its own map, read after the lock was released |
+| `.github/workflows/integration-tests.yml` | installs `qemu-utils` and runs the NBD oracle |
+| `test/required-tests.json` | four NBD gates pinned |
 | `.gitignore` | `test/nbd/artifacts/` (56 MB of downloaded kernel + modules) |
 
-The `write_payload.go` change is a genuine bug fix that affects NFS and SMB too: the FLUSH barrier committed only the block-store half, leaving a client told "durable" with metadata a restart could lose.
+Two of these are genuine bug fixes that affect NFS and SMB too:
+
+- **`write_payload.go`** — the FLUSH barrier committed only the block-store half,
+  leaving a client told "durable" with metadata a restart could lose.
+- **`pending_writes.go`** — `RecordWrite` returned a pointer into the tracker's own
+  map, which `deferredCommitWrite` read after releasing the lock. That was safe
+  only while every adapter dispatched one command at a time per file. NFS and SMB
+  happen to satisfy that today, so the race was unreachable through them — which is
+  why it was never observed. It is still a latent bug in the shared layer, and
+  pipelining made it ordinary.
+
 
 ---
 
@@ -199,50 +303,56 @@ The `write_payload.go` change is a genuine bug fix that affects NFS and SMB too:
 
 The point of this repository is to make a merge proposal possible, so the history was reconstructed to make one clean.
 
-**All 39 files are byte-identical to the original branch.** Verified at extraction, per file:
+**All 53 files the branch touches are byte-identical to the original branch**, except one deliberate difference. Verified per file against `nbd-on-036`:
 
 ```
-$ git ls-tree -r 498a9d9 > new.txt     # last commit before the review fixes
-$ git ls-tree -r nbd-on-036 > orig.txt # the original branch tip
-# compare the blob SHA of every path present in both
-shared: 39, identical: 39, differing: 0
+files in branch: 53
+IDENTICAL: 52  DIFFERS: 1  MISSING: 0
+  DIFF test/nbd/deploy/config-server2.yaml
 ```
 
-(Whole-tree hashes necessarily differ — the original branch has 3,305 files and this extraction has the 39 the NBD work touches. What matters for a patch is that every one of those 39 blobs is identical.)
+The one difference is the redaction: that file carried the live deployment's public address and JWT secret. It is the only file that differs, and it differs on purpose.
 
-**The history is 77 NBD commits** — the same commits, same authors, same timestamps, same messages, in the same order — replayed onto DittoFS **v0.36.0** (`51fc8443`). Unrelated upstream commits that the extraction would otherwise have carried are dropped; nothing about the NBD work is lost.
+(Whole-tree hashes necessarily differ — the original branch has 3,305 files and this extraction has the 53 the NBD work touches. What matters for a patch is that every one of those blobs is identical.)
 
-**The merge was tested, not assumed.** This is worth being precise about, because the first attempt failed. The branch was originally described as based on `f2183422`, but cherry-picking the range there does **not** compile:
+**The history is 103 NBD commits** — the same commits, same authors, same timestamps, same messages, in the same order — replayed onto DittoFS **v0.36.0** (`51fc8443`). Unrelated upstream commits that the extraction would otherwise have carried are dropped; nothing about the NBD work is lost.
+
+**The merge was tested, not assumed.** The result is not "the patches apply"; it is a tree that builds and passes at the base. Overlaying the branch's 53 files onto v0.36.0 and resolving one conflict:
+
+```
+go build ./...                                              PASS
+go test ./internal/adapter/nbd/ ./pkg/adapter/nbd/          ok 8.2s / ok 1.7s
+go test ./internal/adapter/... ./pkg/adapter/... ./pkg/metadata/...
+                                                            63 packages ok, 0 failures
+```
+
+**The one conflict** is a rename collision. v0.36.0 has the lowercase `normalizeBlockStoreError(err)`; this branch exported it to `NormalizeBlockStoreError(err)` in `feat(nbd): connection loop and READ handler`. Take the branch's name — that is the whole resolution.
+
+An earlier version of this section claimed the base was `f2183422` and that the range applied with two conflicts including `.gitignore`. Both were wrong, and the first was caught only by trying it:
 
 ```
 internal/adapter/common/payload_operation.go:31:19:
     blockStore.WithPayloadScope undefined (type *engine.Store has no field or method WithPayloadScope)
 ```
 
-`WithPayloadScope` arrives upstream in `2a3d7f76` (#2958) and is refined by `68946fe3` (#3030), both of which the branch carries and the extraction dropped. The real base is **v0.36.0** (`51fc8443`), which contains both. At that base the range applies with two trivial conflicts:
+`WithPayloadScope` arrives upstream in `2a3d7f76` (#2958) and is refined by `68946fe3` (#3030), both ancestors of v0.36.0 and both dropped by the extraction as unrelated. The `.gitignore` conflict disappeared once the extraction stopped carrying that file at all. The real base is **v0.36.0** (`51fc8443`).
 
-| Conflict | Resolution |
+`go test ./...` has two failures, neither from this work: `test/harness/known` fails at the v0.36.0 baseline too (macOS bash 3.2 has no `declare -A`), and `TestBLAKE3FasterThanSHA256` is a load-sensitive benchmark gate on an untouched package (`pkg/block` is not among the 53 changed files) that passes when run alone.
+
+### What is in this repository but would not be part of a merge
+
+Five files exist to document the extraction and would collide with DittoFS's own on a naive merge:
+
+| File | Why it must not merge |
 |---|---|
-| `.gitignore` | both sides append at EOF; keep both blocks |
-| `internal/adapter/common/payload_operation.go` | `normalizeBlockStoreError` was exported to `NormalizeBlockStoreError` on this branch; take the branch's name |
+| `README.md` | DittoFS has its own; this one describes the extraction |
+| `LICENSE` | DittoFS already has the identical MIT text |
+| `.gitattributes` | pins line endings for this repo's contents |
+| `docs/nbd-benchmarks.md` | measured results for this branch, written for a reviewer |
+| `docs/nbd-block-status.md` | the BLOCK_STATUS refusal rationale, written for a reviewer |
+| `docs/sdd/` (32 files) | the SDD record; lived in `.superpowers/`, which DittoFS gitignores |
 
-After resolving those two, all 77 commits land and:
-
-```
-go build ./...                                           PASS
-go test ./internal/adapter/nbd/... ./pkg/adapter/nbd/...  ok 7.3s / ok 1.2s
-go test ./internal/adapter/... ./pkg/adapter/...          51 packages ok, 0 failures
-```
-
-`go test ./...` has two failures, neither from this work: `test/harness/known` fails at the v0.36.0 baseline too (macOS bash 3.2 has no `declare -A`), and `TestBLAKE3FasterThanSHA256` is a load-sensitive benchmark gate on an untouched package (`pkg/block` is not among the 39 changed files) that passes when run alone.
-
-**What changed from the original branch:**
-
-- `merge: NBD adapter onto v0.36.0` is excluded — it merged upstream into the branch, which is not meaningful in an extraction.
-- Five commits on top: the two fixes above (`89f2e4a`, `69e80b8`), a redaction commit (`e5b8bf2`), the SDD record, and this README.
-- `test/nbd/deploy/config-server2.yaml` had the real deployment's JWT secret and public address; both are redacted.
-- `docs/sdd/` is new here — the SDD artifacts lived in `.superpowers/`, which is gitignored upstream.
-- The 82 commits' author emails were rewritten to a GitHub noreply address; three carried a laptop hostname.
+Apply the other 53 files and nothing else. The verification above did exactly that: it overlaid 53 files and skipped these 37, and confirmed afterwards that all 53 were byte-identical to the branch with zero mismatches.
 
 ### To propose the merge
 
@@ -253,21 +363,17 @@ git checkout 51fc8443          # v0.36.0 — the verified base
 git remote add nbd-exp https://github.com/esignoretti/NBD-experimental.git
 git fetch nbd-exp
 
-# 62acc10 is the baseline commit in this repository; the range is the 77 NBD commits.
-git cherry-pick 62acc10..498a9d9
+# 62acc10 is the baseline commit in this repository; the range is the 103 NBD commits.
+git cherry-pick 62acc10..nbd-exp/main
 
-# Expect the two conflicts above, resolve them as described, then:
-go build ./... && go test ./internal/adapter/nbd/... ./pkg/adapter/nbd/...
+# Expect the rename conflict in payload_operation.go, resolve it as described, then:
+go build ./... && go test ./internal/adapter/nbd/ ./pkg/adapter/nbd/
 ```
-
-`498a9d9` is the last commit before the review fixes; extend the range to `nbd-exp/main` to take the two fixes and the redaction as well (the README commit will conflict add/add, since DittoFS already has one — skip it).
 
 Two things to check that this repository cannot check for you:
 
 1. **The ten modified files may have moved on.** The merge was verified against `51fc8443`; if `write_payload.go`, `start.go` or `normalize.go` changed after v0.36.0, expect conflicts there. Re-verify each premise — the SDD ledger's own standing hazard is *"audits predate later fixes — re-verify each premise on develop."*
-2. **`crash-restart.sh` still has not run end to end**, and there is still no CI job. Both are worth doing before a merge rather than after.
-
----
+2. **`crash-restart.sh` has run, but only in a container.** It needs Linux, root and an `nbd-client` built from upstream master (3.26.1 has no `-T`; 3.27.1's `--persist` is silently dead). See [`docs/nbd-benchmarks.md`](docs/nbd-benchmarks.md).
 
 ## Credit
 
