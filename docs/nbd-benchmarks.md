@@ -180,27 +180,35 @@ With several commands allowed in flight, the obvious worry is that a crash loses
 one request and `-t` requeues only the one whose timer fired. **It does not.** Every in-flight
 request carries its own block-layer timer and each requeues independently.
 
-Measured against a fixture with `max_in_flight=4` serving 2 GiB, with the server SIGKILLed
-while `fio` held a real queue depth:
+Measured against the committed fixture (`test/nbd/fixture`) with `-in-flight 4` serving 2 GiB,
+the server SIGKILLed while `fio` held `iodepth=8`:
 
 | Test | In flight at kill | Result |
 | --- | --- | --- |
-| random 4 KiB reads, `iodepth=8`, crc32c verify | 8 | `err=0`, every block verified |
-| random 4 KiB reads, `iodepth=8` (repeat) | 9 | `err=0`, every block verified |
+| random 4 KiB reads, `iodepth=8`, 20 000 IOs | 8 | `err=0` |
+| **sequential read verify of all 4 096 blocks afterwards** | — | `err=0`, every block crc32c-clean |
 | random 4 KiB writes, `iodepth=8` | 8 | `err=0`, all 64 MiB landed |
-| random 4 KiB reads, `iodepth=8` (committed fixture) | 8 | `err=0`, region A intact |
+| region A (1 MiB written and flushed pre-crash) | — | byte-identical, and a fresh client agrees |
 
-**Do not count the kernel log to establish this.** The obvious evidence — one
-`Connection timed out, retrying` line per request — is not reliable, because that line is
-emitted with `dev_err_ratelimited` (`nbd.c:437`). Repeated runs of the identical test logged
-8, then 3, then **1** line for 8 in-flight requests, and every run passed. The count is a
-rate-limited sample, not a requeue tally; an earlier draft of this section cited it as
-evidence, which was wrong.
+**Three ways to measure this wrong, all of which I did first.**
 
-The evidence that does hold is behavioural and comes from two places that cannot be
-rate-limited: `/sys/block/nbdN/inflight` reports how many commands were outstanding at the
-instant of the kill, and a verifying client reports whether all of them completed with
-correct data afterwards. Eight outstanding, `err=0`, every block verified.
+1. **Counting `Connection timed out, retrying` lines.** That message is emitted with
+   `dev_err_ratelimited` (`drivers/block/nbd.c:437`), so identical runs logged 8, then 3,
+   then **1** line for 8 in-flight requests, and all three passed. It is a rate-limited
+   sample, not a requeue tally.
+2. **Random reads as the verification step.** `fio --rw=randread --number_ios=600` over a
+   16 MiB region reads 600 of 4 096 blocks, so a corrupted block is very likely never
+   visited. The negative control proved this the hard way: I zeroed a known block and the
+   "verify" still returned `err=0`. Random verification can only fail by luck.
+3. **Trusting `err=0` without a control that makes it fail.** The verifier is real
+   (`--verify=crc32c` on a corrupted file returns `err=84` = EILSEQ), but that only means
+   something once you have watched it fire. Seed, verify clean, corrupt one block, verify
+   again: `err=0`, then `err=84`. Without that sequence a green run is unfalsifiable.
+
+The evidence that does hold is **sequential** verification, which is deterministic: read
+all 4 096 blocks after the restart and check every one. That is the `err=0` in the table.
+It is combined with `/sys/block/nbdN/inflight`, which reports how many commands were
+outstanding at the instant of the kill and cannot be rate-limited either.
 
 That this follows from the code rather than from luck: `nbd_xmit_timeout` is the
 block-layer per-request timeout handler (`nbd.c:1781` `.timeout = nbd_xmit_timeout`), it
@@ -209,10 +217,10 @@ Pipelining changes how many commands the server holds, not how many timers the k
 An unhandled request would surface as `err=5` (EIO) from `fio`, not as a missing log line.
 
 **A pre-crash write still survives.** Region A (1 MiB) was written and flushed, then a
-random-write workload to a different region was killed mid-flight. After the restart:
-region A read back **byte-identical** (`bf264b728f1d35e3c1e0c57cdd43bfcd` before and after),
-and a **fresh** client read the same region with the same hash — so it came from the store,
-not from the paused client's cache. The journal on disk held 148 MB across 16 segments.
+workload to a different region was killed mid-flight. After the restart: region A read back
+**byte-identical** (`9c331763c0def27a2b6048dc33dc8658` before and after), and a **fresh**
+client read the same region with the same hash — so it came from the store, not from the
+paused client's cache. The journal on disk held 148 MB across 16 segments.
 Repeated with the committed fixture and a read workload: `01f59fa372d2b61184f3eac05a129571`
 before and after.
 
