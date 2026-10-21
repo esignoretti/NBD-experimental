@@ -9,7 +9,7 @@ Three results are worth reading even if you skip the tables:
 then gain nothing through depth 64. That is the measurement that motivates the pipelining
 work, and it is the one number in this document that should change when that work lands.
 - **Crash/reconnect now passes end to end.** The rig existed but had never been executed;
-  running it found a real bug in the rig itself (fixed in `5480f219`), and after the fix the
+  running it found a real bug in the rig itself (fixed in `37f03113`), and after the fix the
   test passes and its negative control fails in exactly the way it must.
 - **The live server's numbers do not reproduce the ones previously published**, and the
   reason is the backing store, not the adapter. That investigation is written up in full
@@ -21,7 +21,7 @@ work, and it is the one number in this document that should change when that wor
 
 | | |
 |---|---|
-| Branch | `nbd-on-036` at `5480f219` |
+| Branch | `nbd-on-036` at `37f03113` |
 | macOS arm64 | Go 1.27.2, `qemu-img`, `qemu-system-x86_64`, `qemu-nbd` 10.x |
 | Linux amd64 | 2 vCPU host, kernel 6.8, `nbd-client` built from upstream `master` (`9c69969`) |
 | Storage backends | RAM-backed fixture (isolates the adapter) and the live S3-backed server |
@@ -161,7 +161,7 @@ dd: error writing '/dev/nbd6': No space left on device
 crash-restart.sh: REFUSING: ... the volume and volumes/ must be owned by UID/GID 65534 ...
 ```
 
-The fix waits for the capacity as well as the node. Committed as `5480f219`. This is the
+The fix waits for the capacity as well as the node. Committed as `37f03113`. This is the
 argument for executing a rig rather than reviewing it: the script was carefully written,
 thoroughly commented, and its first real run produced a confidently wrong diagnosis.
 

@@ -159,7 +159,7 @@ should have got an answer.
 built from `master` — no released version can reconnect. Its first end-to-end run
 found that it waited for the block *node* while `/sys/block/nbdN/size` was still 0,
 so a write failed `ENOSPC` on a healthy export and the script blamed the adapter
-identity. Fixed in `5480f219`; transcripts are in `docs/nbd-benchmarks.md`.
+identity. Fixed in `37f03113`; transcripts are in `docs/nbd-benchmarks.md`.
 
 **2. One missing artifact.** "The deploy script" is referenced twice in
 `test/nbd/deploy/config-server2.yaml` and does not exist. (`bench-fio.sh`, which
