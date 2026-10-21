@@ -174,6 +174,67 @@ at all, and the rig refuses it by name with an accurate explanation. Building fr
 `master` works. The claims in `test/nbd/README.md` about which client versions can reconnect,
 and about the client needing the init network namespace, are correct as written.
 
+### Pipelining does not weaken the crash guarantee — measured, not argued
+
+With several commands allowed in flight, the obvious worry is that a crash loses more than
+one request and `-t` requeues only the one whose timer fired. **It does not.** Every in-flight
+request carries its own block-layer timer and each requeues independently.
+
+Measured against a fixture with `max_in_flight=4` serving 2 GiB, with the server SIGKILLed
+while `fio` held a real queue depth:
+
+| Test | In flight at kill | Independent requeues | Result |
+| --- | --- | --- | --- |
+| random 4 KiB reads, `iodepth=8`, crc32c verify | 8 | 8 | `err=0`, every block verified |
+| random 4 KiB reads, `iodepth=8` (second run) | 9 | 3 logged, remainder completed on reconnect | `err=0` |
+| random 4 KiB writes, `iodepth=8` | 8 | 8 | `err=0`, all 64 MiB landed |
+
+The kernel log shows one `Connection timed out, retrying` line **per request**, not one per
+connection:
+
+```
+[Wed Oct 21 22:45:59 2026] block nbd7: Connection timed out, retrying (0/1 alive)
+[Wed Oct 21 22:45:59 2026] block nbd7: Connection timed out, retrying (0/1 alive)
+[Wed Oct 21 22:45:59 2026] block nbd7: Connection timed out, retrying (0/1 alive)
+[Wed Oct 21 22:45:59 2026] block nbd7: Dead connection, failed to find a fallback
+[Wed Oct 21 22:45:59 2026] block nbd7: reconnected socket
+```
+
+This follows from the code rather than from luck: `nbd_xmit_timeout` is the block-layer
+per-request timeout handler (`nbd.c:1781` `.timeout = nbd_xmit_timeout`), it takes
+`cmd->lock` for *that* command and calls `nbd_requeue_cmd(cmd)` for it alone. Pipelining
+changes how many commands the server holds, not how many timers the kernel arms.
+
+**A pre-crash write still survives.** Region A (1 MiB) was written and flushed, then a
+random-write workload to a different region was killed mid-flight. After the restart:
+region A read back **byte-identical** (`bf264b728f1d35e3c1e0c57cdd43bfcd` before and after),
+and a **fresh** client read the same region with the same hash — so it came from the store,
+not from the paused client's cache. The journal on disk held 148 MB across 16 segments.
+
+### The trap in this test: an in-memory metadata store fakes a corruption bug
+
+The first version of this crash test reported `err=84` (EILSEQ) — a verify failure, i.e. it
+looked exactly like the adapter corrupting data. It was the fixture. The metadata store was
+`NewInMemoryBadgerMetadataStore`, so the SIGKILL erased the file's size and its chunk
+manifest; after the restart every read returned zeros and `fio` called that corruption.
+
+The control that separated the two is the one that matters: **the same seed and verify with
+no crash passed (`err=0`)**. Only then is a crash-run failure attributable to the crash. With
+the metadata store moved to disk (`NewBadgerMetadataStoreWithDefaults(ctx, path)`) the same
+crash run passed.
+
+Two lessons, both cheap to state and expensive to learn:
+
+- A crash test against an in-memory store tests the fixture, not the server. Whatever holds
+the file's size and manifest must survive the kill, or the restart serves zeros.
+- Run the no-crash control **first**. Without it, `err=84` reads as a data-integrity bug in
+the adapter, and the investigation starts in the wrong place entirely.
+
+A third, smaller trap: a fixture that prints `READY` after `Serve` already failed to bind.
+An older fixture still holding the port answered the clients, so the run silently measured
+the *previous* server. The fixture now dials its own port and exits non-zero if nothing is
+listening.
+
 ### A bug in the rig, found by running it
 
 The rig waited for the block *node* before writing its pattern:
