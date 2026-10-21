@@ -61,7 +61,7 @@ theirs-only  = 0x0c00     (SEND_CACHE and SEND_FAST_ZERO, which we deliberately 
 
 **A crash/reconnect mechanism proven end to end.** `test/nbd/crash-restart.sh` SIGKILLs the server mid-flight, proves the kernel client's I/O *pauses* rather than failing, then restarts the server inside the window and proves the read *resumes with the pre-crash bytes*. It passes, and its negative control fails in exactly the way it must. Getting there required an `nbd-client` built from upstream `master`: 3.26.1 has no `-T` at all, and 3.27.1's persist is silently dead on the netlink path (`persist_mode` is never assigned `true`). Transcripts in [`docs/nbd-benchmarks.md`](docs/nbd-benchmarks.md).
 
-**And pipelining does not weaken it.** The obvious worry about allowing several commands in flight is that a crash loses more than one request while `-t` requeues only the one whose timer fired. Measured with `iodepth=8` against a server killed mid-flight: 8 requests in flight, **8 independent requeues**, `err=0` and every block verified — for reads and for writes. Each request carries its own block-layer timer, so this follows from `nbd_xmit_timeout` taking `cmd->lock` for one command at a time, not from luck.
+**And pipelining does not weaken it.** The obvious worry about allowing several commands in flight is that a crash loses more than one request while `-t` requeues only the one whose timer fired. Measured with `iodepth=8` against a server killed mid-flight: 8 requests outstanding at the kill (`/sys/block/nbdN/inflight`), `err=0` with every block verified, for reads and for writes. Each request carries its own block-layer timer, so this follows from `nbd_xmit_timeout` taking `cmd->lock` for one command at a time, not from luck. Do not try to confirm it by counting `Connection timed out, retrying` lines — that message is rate-limited (`dev_err_ratelimited`), so the count is a sample, not a tally.
 
 ### Measured performance
 
@@ -274,6 +274,7 @@ test/nbd/                        the proof rigs
   bench-fio.sh                    depth sweep, sequential, fsync-per-4KiB
   fetch-artifacts.sh              20 KB: downloads the kernel + nbd.ko
   run-oracle.sh                   differential run against qemu-nbd
+  fixture/main.go                 the server a crash rig has to SIGKILL
   deploy/config-server2.yaml      demo host config, with the memory budget
 
 docs/nbd-benchmarks.md           ⚠ added here: every measured result, with method

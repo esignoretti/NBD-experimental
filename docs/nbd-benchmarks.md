@@ -183,33 +183,38 @@ request carries its own block-layer timer and each requeues independently.
 Measured against a fixture with `max_in_flight=4` serving 2 GiB, with the server SIGKILLed
 while `fio` held a real queue depth:
 
-| Test | In flight at kill | Independent requeues | Result |
-| --- | --- | --- | --- |
-| random 4 KiB reads, `iodepth=8`, crc32c verify | 8 | 8 | `err=0`, every block verified |
-| random 4 KiB reads, `iodepth=8` (second run) | 9 | 3 logged, remainder completed on reconnect | `err=0` |
-| random 4 KiB writes, `iodepth=8` | 8 | 8 | `err=0`, all 64 MiB landed |
+| Test | In flight at kill | Result |
+| --- | --- | --- |
+| random 4 KiB reads, `iodepth=8`, crc32c verify | 8 | `err=0`, every block verified |
+| random 4 KiB reads, `iodepth=8` (repeat) | 9 | `err=0`, every block verified |
+| random 4 KiB writes, `iodepth=8` | 8 | `err=0`, all 64 MiB landed |
+| random 4 KiB reads, `iodepth=8` (committed fixture) | 8 | `err=0`, region A intact |
 
-The kernel log shows one `Connection timed out, retrying` line **per request**, not one per
-connection:
+**Do not count the kernel log to establish this.** The obvious evidence — one
+`Connection timed out, retrying` line per request — is not reliable, because that line is
+emitted with `dev_err_ratelimited` (`nbd.c:437`). Repeated runs of the identical test logged
+8, then 3, then **1** line for 8 in-flight requests, and every run passed. The count is a
+rate-limited sample, not a requeue tally; an earlier draft of this section cited it as
+evidence, which was wrong.
 
-```
-[Wed Oct 21 22:45:59 2026] block nbd7: Connection timed out, retrying (0/1 alive)
-[Wed Oct 21 22:45:59 2026] block nbd7: Connection timed out, retrying (0/1 alive)
-[Wed Oct 21 22:45:59 2026] block nbd7: Connection timed out, retrying (0/1 alive)
-[Wed Oct 21 22:45:59 2026] block nbd7: Dead connection, failed to find a fallback
-[Wed Oct 21 22:45:59 2026] block nbd7: reconnected socket
-```
+The evidence that does hold is behavioural and comes from two places that cannot be
+rate-limited: `/sys/block/nbdN/inflight` reports how many commands were outstanding at the
+instant of the kill, and a verifying client reports whether all of them completed with
+correct data afterwards. Eight outstanding, `err=0`, every block verified.
 
-This follows from the code rather than from luck: `nbd_xmit_timeout` is the block-layer
-per-request timeout handler (`nbd.c:1781` `.timeout = nbd_xmit_timeout`), it takes
-`cmd->lock` for *that* command and calls `nbd_requeue_cmd(cmd)` for it alone. Pipelining
-changes how many commands the server holds, not how many timers the kernel arms.
+That this follows from the code rather than from luck: `nbd_xmit_timeout` is the
+block-layer per-request timeout handler (`nbd.c:1781` `.timeout = nbd_xmit_timeout`), it
+takes `cmd->lock` for *that* command and calls `nbd_requeue_cmd(cmd)` for it alone.
+Pipelining changes how many commands the server holds, not how many timers the kernel arms.
+An unhandled request would surface as `err=5` (EIO) from `fio`, not as a missing log line.
 
 **A pre-crash write still survives.** Region A (1 MiB) was written and flushed, then a
 random-write workload to a different region was killed mid-flight. After the restart:
 region A read back **byte-identical** (`bf264b728f1d35e3c1e0c57cdd43bfcd` before and after),
 and a **fresh** client read the same region with the same hash — so it came from the store,
 not from the paused client's cache. The journal on disk held 148 MB across 16 segments.
+Repeated with the committed fixture and a read workload: `01f59fa372d2b61184f3eac05a129571`
+before and after.
 
 ### The trap in this test: an in-memory metadata store fakes a corruption bug
 
