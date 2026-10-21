@@ -2,7 +2,7 @@
 
 An NBD (Network Block Device) adapter for [DittoFS](https://github.com/marmos91/dittofs), extracted for review and merge proposal.
 
-**Status:** a working prototype. The protocol is implemented end to end and has booted a real kernel from a real export, but it is not production-ready: pipelining is planned and unstarted, there is no CI coverage, and several minor issues are recorded but unfixed. Two bugs found in review are fixed here. Never merged upstream. See [Status](#status).
+**Status:** a working prototype. The protocol is implemented end to end and has booted a real kernel from a real export, but it is not production-ready: pipelining is planned and unstarted, there is no CI coverage, and several minor issues are recorded but unfixed. Two bugs found in review are fixed here, and so is one found by running the crash rig. Never merged upstream. See [Status](#status) and [`docs/nbd-benchmarks.md`](docs/nbd-benchmarks.md).
 
 **This is not a standalone project.** It is an extraction of one feature branch — 77 commits — from the DittoFS repository. Every file sits at its exact upstream path so that the commits apply 1:1 to DittoFS. See [Merging upstream](#merging-upstream).
 
@@ -54,22 +54,21 @@ ours-only    = 0x0000     (we advertise nothing qemu-nbd does not)
 theirs-only  = 0x0c00     (bits we deliberately do not set)
 ```
 
-**A crash/reconnect mechanism proven by hand.** `test/nbd/crash-restart.sh` is written but has never run end to end — it needs Linux, root, and an `nbd-client` built from upstream `master`. The mechanism itself was proven in a container: with `-persist -T 60`, a read blocked at t=4s/8s/12s while the server was down and completed with `exit=0 elapsed=14s` when it returned. Getting there required finding that `nbd-client` 3.26.1 has no `-T` at all and 3.27.1's persist is silently dead on the netlink path (`persist_mode` is never assigned `true`) — only upstream `master` works.
+**A crash/reconnect mechanism proven end to end.** `test/nbd/crash-restart.sh` SIGKILLs the server mid-flight, proves the kernel client's I/O *pauses* rather than failing, then restarts the server inside the window and proves the read *resumes with the pre-crash bytes*. It passes, and its negative control fails in exactly the way it must. Getting there required an `nbd-client` built from upstream `master`: 3.26.1 has no `-T` at all, and 3.27.1's persist is silently dead on the netlink path (`persist_mode` is never assigned `true`). Transcripts in [`docs/nbd-benchmarks.md`](docs/nbd-benchmarks.md).
 
 ### Measured performance
 
-Random 4 KiB read IOPS by queue depth, against a live 2-vCPU host:
+Random 4 KiB read IOPS by queue depth, 10,000 operations, best of 3, against a RAM-backed store on a 2-vCPU Linux host:
 
-| Depth | 1 | 8 | 16 | 32 | 64 |
-|---|---|---|---|---|---|
-| IOPS | 5,328 | 8,880 | 8,955 | 9,245 | 8,918 |
+| Depth | 1 | 2 | 4 | 8 | 16 | 32 | 64 |
+|---|---|---|---|---|---|---|---|
+| IOPS | 7,686 | 11,325 | **14,104** | 14,450 | 13,297 | 14,124 | 13,586 |
 
-**Flat from depth 8.** That plateau is the finding that motivates the open work below: the dispatch loop handles one command at a time, so adding queue depth buys nothing past the point where a single command's latency is saturated.
+**Flat from depth 4.** That plateau is the finding that motivates the open work below: the dispatch loop handles one command at a time, so adding queue depth buys nothing past the point where a single command's latency is saturated. Run-to-run variance on this host is ±15–20%, so treat the shape as the finding and any single figure as approximate. Sequential reads are flat in depth too (1,259 → 1,302 MiB/s); sequential writes could not be measured reliably here and no figure is claimed.
 
-Two other numbers worth knowing:
+**Chunk size was the single biggest win.** The default block-store profile chunks at 1 MiB, so a 4 KiB random read that misses cache fetches 1 MiB — up to 256× amplification. Setting `chunk_size: 131072` for VM images took depth-1 IOPS from 847 to 5,328 (**6.3×**). Reads never re-chunk, so this only affects newly written data.
 
-- **Chunk size was the single biggest win.** The default block-store profile chunks at 1 MiB, so a 4 KiB random read that misses cache fetches 1 MiB — up to 256× amplification. Setting `chunk_size: 131072` for VM images took depth-1 IOPS from 847 to 5,328 (**6.3×**). Reads never re-chunk, so this only affects newly written data.
-- **Sequential** read 46–52 MiB/s (the device does 80), write 169 MiB/s, fsync-per-4KiB-write 208 IOPS at 4.15 ms p99.
+All of this, plus the functional results, the crash/reconnect proof, the live-server investigation and the measurement traps that produce wrong numbers, is in **[`docs/nbd-benchmarks.md`](docs/nbd-benchmarks.md)**.
 
 ---
 
@@ -89,15 +88,17 @@ Two bugs found in a full code review and fixed on top of the branch. Both have r
 
 Note that the FLUSH barrier's correctness currently rests on serialization — `handlers_control.go` says so explicitly. Pipelining invalidates that argument and the barrier needs real in-flight tracking.
 
-**2. `crash-restart.sh` needs a Linux host** with KVM, root, and an `nbd-client` built from `master`. See above.
+**2. `crash-restart.sh` passes, and needed a rig fix to get there.** It requires a Linux host with root and an `nbd-client` built from `master` — no released version can reconnect. Its first end-to-end run found that it waited for the block *node* while `/sys/block/nbdN/size` was still 0, so a write failed `ENOSPC` on a healthy export and the script blamed the adapter identity. Fixed in `5480f219`. The test and its negative control both now behave as designed; transcripts are in `docs/nbd-benchmarks.md`.
 
 **3. Missing artifacts.** `bench-fio.sh` is cited by the pipelining plan and does not exist. "The deploy script" is referenced twice in `test/nbd/deploy/config-server2.yaml` and does not exist.
 
 **4. No CI coverage.** `nbd` appears in no GitHub workflow and is not in `test/required-tests.json`. Everything above is green locally and enforced nowhere.
 
+**5. The live demo server is not usable for benchmarking.** The same depth sweep against the live S3-backed host reads ~92 IOPS and stays flat, because its local tier is not retaining reads (`hit-ratio: 0.40`, cache life expectancy 2.00 s at p50). That is a cache-configuration finding, not an adapter one — but it needs its own investigation before any number from that host means anything. Detail in `docs/nbd-benchmarks.md` §5.
+
 ### Known minor issues
 
-Recorded, not fixed. The full list of 29 deferred minors is in `docs/sdd/progress.md`.
+Recorded, not fixed. The full list of 14 deferred minors is in `docs/sdd/progress.md`.
 
 | Issue | Where |
 |---|---|
@@ -106,7 +107,7 @@ Recorded, not fixed. The full list of 29 deferred minors is in `docs/sdd/progres
 | `PunchHole` is the only block-store call without a request deadline | `handlers_write.go:265` |
 | `handleFlush` does not validate flags, unlike every other command | `handlers_control.go:22` |
 | No buffer pooling on READ/WRITE — `make` per command, up to 32 MiB | `handlers_read.go:88` |
-| 11 dead protocol constants and 4 test-only codec functions | `protocol.go` |
+| 10 dead protocol constants, 6 test-only ones, and 1 dead + 4 test-only codec functions | `protocol.go` |
 | `handleRead` ignores the returned `n` (safe today: the journal always fills the buffer on nil error) | `handlers_read.go:96` |
 | No read-permission check on the READ path (write path is checked) | `handlers_read.go` |
 | Export size is a handshake-time snapshot, so a truncate over NFS/SMB is invisible to a live NBD connection | `volume.go:146` |
@@ -161,13 +162,15 @@ test/nbd/                        the proof rigs
   run-oracle.sh                   differential run against qemu-nbd
   deploy/config-server2.yaml      demo host config, with the memory budget
 
+docs/nbd-benchmarks.md           ⚠ added here: every measured result, with method
+                                 and the traps that produce wrong numbers
 docs/superpowers/specs/          the design spec (§1–§13)
 docs/superpowers/plans/          the 8-task implementation plan, and the pipelining plan
 docs/sdd/                        ⚠ added here, not upstream: the SDD record —
                                  briefs, reports, review diffs, progress ledger
 ```
 
-Everything above the `docs/sdd/` line exists in DittoFS at that path. `docs/sdd/` does not — see [What is here and what is not](#what-it-does).
+Everything above the `docs/sdd/` line exists in DittoFS at that path. `docs/sdd/` does not — see [What is here and what is not](#what-it-does). `docs/nbd-benchmarks.md` is also new here, and is deliberately *not* called `BENCHMARKS.md`: upstream has a 588-line `docs/BENCHMARKS.md` comparing DittoFS against JuiceFS and rclone, and on a case-insensitive filesystem (macOS default) the two paths would collide on merge.
 
 ### The ten files outside the adapter
 
