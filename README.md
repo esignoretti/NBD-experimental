@@ -159,7 +159,24 @@ should have got an answer.
 built from `master` — no released version can reconnect. Its first end-to-end run
 found that it waited for the block *node* while `/sys/block/nbdN/size` was still 0,
 so a write failed `ENOSPC` on a healthy export and the script blamed the adapter
-identity. Fixed in `37f03113`; transcripts are in `docs/nbd-benchmarks.md`.
+identity. Fixed in `37f03113`.
+
+It has since run end to end on a real Linux host against a 2 GiB export, and that
+run found three more defects in the script, each of which had made a passing run
+impossible or meaningless:
+
+- **`-t` was never passed.** With one connection and no command timeout the kernel
+  resets its timer instead of requeueing (`drivers/block/nbd.c:435` vs `:469`), so
+  the request never reaches `wait_for_reconnect` — it hangs *past* the window
+  rather than failing at it. `-T` alone cannot produce the pause the test claims.
+  The script now requires a nonzero `--cmd-timeout` below `--dead-timeout`.
+- **Pre-flight described the file, not the server.** A run pointed at a production
+  share printed the production size and then crashed a fixture on another port;
+  both runs looked identical until the numbers were compared. The script now reads
+  `/sys/block/<dev>/size` after connecting and refuses on a mismatch, with
+  `--expect-size` for servers whose metadata store is in memory.
+- **Nothing proved the resumed read came from the server.** It is now cross-checked
+  through a fresh client after the restart.
 
 **2. One missing artifact.** "The deploy script" is referenced twice in
 `test/nbd/deploy/config-server2.yaml` and does not exist. (`bench-fio.sh`, which
@@ -373,7 +390,7 @@ go build ./... && go test ./internal/adapter/nbd/ ./pkg/adapter/nbd/
 Two things to check that this repository cannot check for you:
 
 1. **The ten modified files may have moved on.** The merge was verified against `51fc8443`; if `write_payload.go`, `start.go` or `normalize.go` changed after v0.36.0, expect conflicts there. Re-verify each premise — the SDD ledger's own standing hazard is *"audits predate later fixes — re-verify each premise on develop."*
-2. **`crash-restart.sh` has run, but only in a container.** It needs Linux, root and an `nbd-client` built from upstream master (3.26.1 has no `-T`; 3.27.1's `--persist` is silently dead). See [`docs/nbd-benchmarks.md`](docs/nbd-benchmarks.md).
+2. **`crash-restart.sh` has run end to end on a real Linux host, not just in a container.** It needs Linux, root and an `nbd-client` built from upstream master (3.26.1 has no `-T`; 3.27.1's `--persist` is silently dead). The run that first passed also found three defects in the script itself — a missing `-t`, a pre-flight that described the file rather than the running server, and no size cross-check — all fixed and described in [`docs/nbd-benchmarks.md`](docs/nbd-benchmarks.md).
 
 ## Credit
 

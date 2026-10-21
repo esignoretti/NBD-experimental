@@ -110,34 +110,64 @@ flag was never passed. Always generate a fresh initramfs for the export under te
 This is the strongest functional result here, and it was previously unproven.
 
 `test/nbd/crash-restart.sh` SIGKILLs the server mid-flight, proves the kernel client's I/O
-*pauses* rather than failing (that is `-T` reaching the kernel), then restarts the server
-inside the window and proves the read *resumes with the pre-crash bytes* (that is `-p`
-reconnecting).
+*pauses* rather than failing, then restarts the server inside the window and proves the read
+*resumes with the pre-crash bytes*.
+
+Measured on a Linux host against a DittoFS fixture serving a 2 GiB export, with
+`--cmd-timeout 5 --dead-timeout 40` (worst-case pause 45 s):
 
 ```
-=== SIGKILL the server FIRST, before issuing the read
-  server pid 1897295 killed
-=== issue the read — it must PAUSE, not fail (that is -T reaching the kernel)
+=== issue the read — it must PAUSE, not fail (that is -t and -T reaching the kernel)
   read still blocked at t=2s
   read still blocked at t=4s
-=== restart the server inside the window (at t=4s, window 30s)
+=== restart the server inside the window (at t=4s, window 40s)
   restart command returned at t=5s
-  read still blocked at t=8s ... t=28s
-VERDICT: read paused (blocked for >=2s), server restarted at t=5s inside the 30s window,
-read completed status=0 elapsed=31s with PRE-CRASH-PATTERN-AAAA.
+
+VERDICT: read paused (blocked for >=2s), server restarted at t=5s inside the 45s
+window (-t 5s + -T 40s), read completed status=0 elapsed=7s with
+PRE-CRASH-PATTERN-AAAA.
+Blocking proves -t reached the block layer and -T bounded the wait; resuming
+proves -p. All three are present in this run.
+Client logged the link-dead notification, so the kernel multicast reached it and
+-p reconnected.
 ```
+
+**Three timeouts, and why `-t` is not optional.** This is the defect that made the first
+version of the script unable to pass, and it was found by running the script, not by reading
+it. `-T` (`NBD_ATTR_DEAD_CONN_TIMEOUT`) is how long the kernel waits for a new socket; `-t`
+(`NBD_ATTR_TIMEOUT`, `nbd_set_cmd_timeout`) is what makes it *notice* the in-flight request
+is stuck. Without `-t`, `nbd_xmit_timeout` takes the wrong branch with a single connection:
+
+```c
+if (config->num_connections > 1 ||
+    (config->num_connections == 1 && nbd->tag_set.timeout))   // nbd.c:435
+        ... nbd_requeue_cmd(cmd); return BLK_EH_DONE;         // :462
+
+if (!nbd->tag_set.timeout)                                   // :469
+        "Possible stuck request ..." return BLK_EH_RESET_TIMER; // :477,:491
+```
+
+The second branch resets the timer forever, so the request is never requeued and never
+reaches `wait_for_reconnect`. The read then hangs *past* the window instead of failing at
+it — which is exactly what an earlier run here did: `-T 20`, no `-t`, dmesg printed
+`Possible stuck request ... Runtime 30 seconds`, and the read was still blocked at t=41 s.
+That run reported a completion at t=31 s against a 30 s window, which reads as a pass and is
+not one. The script now refuses a `--cmd-timeout` of 0 or one at or above `--dead-timeout`.
 
 **The negative control fails the way it must.** Run with `--keep-dead` (no restart), the same
-rig must report a failure at the window rather than a hang or a success:
-
-```
-VERDICT (negative control): the read failed with status 1 after 10s with no server running
-— that is -T reaching the kernel.
-```
+rig must report a failure at the window rather than a hang or a success. Measured at
+`--cmd-timeout 5 --dead-timeout 20`, the read failed at t=27 s with no server running —
+that is `-t` making the kernel notice the stuck request and `-T` bounding the wait.
 
 Without this control a "pass" proves nothing: a read served from the page cache returns
 instantly and the kill lands on an idle device. The rig's own header documents two earlier
 orderings that looked right and proved nothing; both were tried and rejected.
+
+**The bytes were confirmed to come from the server, not a cache.** Independently of the
+paused client, the same 22 bytes were read back after the restart through a **fresh** client
+(`qemu-io -f raw -c "read -v 0 22" nbd://127.0.0.1:10950/export/boot`), which returned
+`PRE-CRASH-PATTERN-AAAA`. Without that check a resumed read could have been satisfied
+locally and the test would still pass.
 
 **The version trap is real.** `nbd-client` 3.26.1 from the distribution packages has no `-T`
 at all, and the rig refuses it by name with an accurate explanation. Building from upstream
