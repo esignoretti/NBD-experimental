@@ -114,8 +114,41 @@ type Export struct {
 // TransmissionFlags returns the flag word the client is handed for this
 // export. A client acts on these bits without verifying them, so the set is a
 // contract: it names exactly the commands the adapter implements.
+//
+// NBD_FLAG_CAN_MULTI_CONN is advertised unconditionally, and the reason is
+// structural rather than configured. The spec permits it when the server
+// "operates entirely without cache, or ... the cache it uses is shared among
+// all connections to the given device", and both halves hold here:
+//
+//   - The wire layer holds no cache. Conn is {handler, conn} and Handler is
+//     {exporter, stores, meta, id, timeouts, draining, degraded} — there is no
+//     per-connection buffer, no per-connection store handle and no read cache
+//     anywhere between the socket and the block store.
+//   - The block store is resolved per share, not per connection:
+//     common.ResolveForWrite -> Runtime.GetBlockStoreForHandle decodes the
+//     share name out of the file handle and returns the single *engine.Store
+//     that the shares service caches by share name. Two connections to one
+//     export therefore reach the same journal, the same payload admission and
+//     the same per-file flush locks (journal.Store.Flush takes a per-shard
+//     flushMu; metadata.Service.flushPendingWriteForFile takes a per-file
+//     flush lock), so a FLUSH or FUA on one connection is a barrier over the
+//     bytes another connection wrote.
+//
+// An earlier revision withheld this flag and a test asserted that advertising
+// it was "a corruption path". That conflated two different things: two
+// concurrent writes to overlapping bytes have an undefined order, which is
+// ordinary block-device semantics and is unaffected by this flag, while a
+// stale cache read is a real bug, which the shared store rules out. Withholding
+// the flag did not make writes ordered — it only forced every client onto one
+// connection, which is the depth-1 ceiling measured in docs/nbd-benchmarks.md
+// (7,686–10,384 IOPS, against 13,000–16,900 at depth 4 and above, where the
+// figure stops improving because dispatch is serialized). See
+// TestOracle_TransmissionFlagsMatchQemuNBD for the differential check against
+// qemu-nbd in its shared configuration, and
+// TestIntegration_OneBlockStorePerShare for the invariant this rests on.
 func (e *Export) TransmissionFlags() TransmissionFlags {
-	flags := FlagHASFlags | FlagSendFlush | FlagSendFUA | FlagSendTrim | FlagSendWriteZeroes
+	flags := FlagHASFlags | FlagSendFlush | FlagSendFUA | FlagSendTrim |
+		FlagSendWriteZeroes | FlagCanMultiConn
 	if e.ReadOnly {
 		flags |= FlagReadOnly
 	}
