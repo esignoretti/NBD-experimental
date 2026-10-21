@@ -189,6 +189,42 @@ That plateau is the serialization signature: the dispatch loop handles one comma
 time, so once a single command's latency is saturated, more outstanding requests buy
 nothing.
 
+### The same plateau, reproduced in a unit benchmark
+
+The sweeps above need a Linux host, a QEMU guest and a fixture. `bench_test.go` reproduces
+the shape in-process, against a store that sleeps 100 µs per read — latency in the store is
+what makes queue depth matter, because against a nanosecond store the adapter is CPU-bound
+and the question is meaningless.
+
+```
+BenchmarkConnection_ReadDepth1-8           2000   157072 ns/op   26.08 MB/s
+BenchmarkConnection_ReadDepth8-8           2000   137451 ns/op   29.80 MB/s
+BenchmarkConnection_ReadDepth32-8          2000   139021 ns/op   29.46 MB/s
+BenchmarkConnection_ReadDepth64-8          2000   139474 ns/op   29.37 MB/s
+BenchmarkConnection_ReadStoreCeiling-8     2000   120447 ns/op   34.01 MB/s
+```
+
+Depth 1 to 8 buys 12%; 8 to 64 buys nothing. The store ceiling — the same latency store
+driven directly, no protocol in the way — is 120 µs against the adapter's 137 µs, so **88%
+of each request is spent waiting on the store** and the remaining 12% is everything the
+protocol does. Queueing requests behind a serialized dispatcher cannot recover that wait.
+
+This is the number the pipelining work is meant to move. A flat depth-N result after it
+lands is a regression, not noise. Run it with:
+
+```sh
+go test -run '^$' -bench 'BenchmarkConnection_Read' -benchtime 2000x ./internal/adapter/nbd/
+```
+
+`CAN_MULTI_CONN` is a separate lever on the same problem, and it is now advertised. Note
+what the flag does and does not do: the spec says that *in the absence* of it, "clients
+SHOULD NOT multiplex their commands over more than one connection to the export". Presence
+removes that prohibition — it does not make a client open a second connection. A client that
+chooses to (QEMU with multiple `-e` blocks, `nbd-client -C N`, or an application opening two
+sessions) gets a separate dispatcher per connection, so the ceiling above applies per
+connection rather than per export. It does not raise the ceiling *within* one connection —
+that is what pipelining is for.
+
 **Two honesty notes about these numbers.**
 
 First, they do not match the figures previously published for this branch (5,328 / 8,880 /
@@ -340,10 +376,22 @@ done
 ## What these results do and do not show
 
 **Do show:** the protocol works end to end against real clients and a real kernel; the adapter
-advertises nothing it cannot honour; crash/reconnect genuinely pauses and resumes I/O; and the
-dispatch loop is serialized, with the depth plateau as direct evidence.
+advertises nothing it cannot honour; crash/reconnect genuinely pauses and resumes I/O; the
+adapter is coherent across connections, so `CAN_MULTI_CONN` is safe to advertise; and the
+dispatch loop is serialized, with the depth plateau as direct evidence — reproduced both by an
+external sweep and by an in-process benchmark against a latency-injecting store.
 
 **Do not show:** production readiness. There is no pipelining, no CI coverage of these rigs,
 and the live server's cache behaviour needs its own investigation before any number from it
 means anything. The performance figures above describe a prototype with a known bottleneck
 that is scheduled to be removed — not a system that has been tuned.
+
+**Two capabilities are absent by decision, not by omission,** and both are documented rather
+than left to be discovered:
+
+- `BLOCK_STATUS` and structured replies — so `qemu-img map` and `nbdinfo --map` cannot be
+  used, and `qemu-img convert` copies every byte instead of only the allocated ones. The gate,
+  its cost and the checklist to lift it are in [`nbd-block-status.md`](nbd-block-status.md).
+- Snapshots — an export is a live view of one volume, so there is no point-in-time copy to
+  read from. Guest-side file-level backup (`tar`, `rsync`, `restic`, `borg`) is unaffected,
+  because it never asks the block layer.

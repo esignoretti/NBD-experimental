@@ -34,10 +34,13 @@ NBD client  ──►  internal/adapter/nbd/  ──►  block engine  ──►
 | Healthcheck, degradation counter | ✅ |
 | `READ`, `WRITE`, `FLUSH`, `TRIM`, `WRITE_ZEROES`, FUA | ✅ |
 | Read-only exports | ✅ |
+| `CAN_MULTI_CONN` — several connections, coherent across them | ✅ |
 | Payload-length enforcement (advertised 32 MiB maximum) | ✅ |
 | `BLOCK_STATUS`, structured replies, meta-context, `STARTTLS` | ❌ out of scope by design |
 
-`BLOCK_STATUS` and structured replies are deliberately absent, not unfinished: DittoFS's block store cannot answer "is this range allocated?" truthfully without leaking residency information across shares. The spec's gate for this is in `docs/superpowers/specs/2026-10-08-dittofs-nbd-block-protocol-design.md` §7. `STARTTLS` is refused rather than ignored — a client that believed its session was encrypted and was not has no way to notice.
+`CAN_MULTI_CONN` is advertised because the flag's condition holds structurally, not because it was configured: the wire layer holds no cache, and the block store is resolved per *share*, so every connection to one export reaches the same journal and the same per-file flush locks. A `FLUSH` or FUA on one connection is therefore a barrier over bytes another connection wrote. Two tests pin this — `TestIntegration_OneBlockStorePerShare` (every resolution returns the same `*engine.Store`) and `TestIntegration_FlushOnOneConnectionCoversAWriteOnAnother` (a write on one connection is visible through a `FLUSH` on a second) — and the second was verified to fail when the store is deliberately made per-connection.
+
+`BLOCK_STATUS` and structured replies are deliberately absent, not unfinished: advertising a residency query whose under-report case is guarded only by a runtime invariant would trade a documented limitation for an undocumented data-loss path. [`docs/nbd-block-status.md`](docs/nbd-block-status.md) states what this costs (sparse copies become full copies), what would have to be true to lift it, and what to do instead. `STARTTLS` is refused rather than ignored — a client that believed its session was encrypted and was not has no way to notice.
 
 ### What was proven, and how
 
@@ -48,11 +51,13 @@ This is the part worth reading before trusting any of the above.
 **A differential oracle against `qemu-nbd`.** `test/nbd/run-oracle.sh` and `internal/adapter/nbd/oracle_test.go` drive the real handler with a real independent NBD client and compare wire behaviour. Measured transmission-flag words:
 
 ```
-DittoFS  = 0x006d
-qemu-nbd = 0x0c6d
+DittoFS  = 0x016d
+qemu-nbd = 0x0d6d
 ours-only    = 0x0000     (we advertise nothing qemu-nbd does not)
-theirs-only  = 0x0c00     (bits we deliberately do not set)
+theirs-only  = 0x0c00     (SEND_CACHE and SEND_FAST_ZERO, which we deliberately do not set)
 ```
+
+`qemu-nbd` is run with `--shared=0`. That is load-bearing: its `--shared` default is `1`, i.e. one client at a time, and it withholds `NBD_FLAG_CAN_MULTI_CONN` in that mode. Measured, `--shared=1` gives `0x0c6d` and `--shared=0` gives `0x0d6d` — the only difference is the bit under test, so comparing against the default would assert that this adapter behaves like a single-client server.
 
 **A crash/reconnect mechanism proven end to end.** `test/nbd/crash-restart.sh` SIGKILLs the server mid-flight, proves the kernel client's I/O *pauses* rather than failing, then restarts the server inside the window and proves the read *resumes with the pre-crash bytes*. It passes, and its negative control fails in exactly the way it must. Getting there required an `nbd-client` built from upstream `master`: 3.26.1 has no `-T` at all, and 3.27.1's persist is silently dead on the netlink path (`persist_mode` is never assigned `true`). Transcripts in [`docs/nbd-benchmarks.md`](docs/nbd-benchmarks.md).
 
