@@ -4,7 +4,7 @@ An NBD (Network Block Device) adapter for [DittoFS](https://github.com/marmos91/
 
 **Status:** a working prototype, now pipelined and snapshot-capable. The protocol is implemented end to end, it has booted a real kernel from a real export, it serves several commands per connection concurrently — depth 16 measures 1.45× what the serialized dispatcher reached — and a VM can boot from a **snapshot** of its own volume while the production volume keeps running. It is still not production-ready: no CI job runs the kernel-boot rig, buffer pooling is unbuilt, and a handful of minors are recorded. Nine defects found by review and by running the rigs are fixed here. Never merged upstream. See [Status](#status) and [`docs/nbd-benchmarks.md`](docs/nbd-benchmarks.md).
 
-**This is not a standalone project.** It is an extraction of one feature branch — 116 commits — from the DittoFS repository. Every file sits at its exact upstream path, so a merge is a file overlay rather than a patch series — see [Merging upstream](#merging-upstream).
+**This is not a standalone project.** It is an extraction of one feature branch — 119 commits — from the DittoFS repository. Every file sits at its exact upstream path, so a merge is a file overlay rather than a patch series — see [Merging upstream](#merging-upstream).
 
 **What is here and what is not.** The 88 files this branch touches are extracted verbatim; the rest of DittoFS is not included, so this repository does not build on its own and has no `go.mod`. That is deliberate — it is a patch set with documentation, not a fork. `docs/sdd/` is the exception: those artifacts were never tracked upstream (they lived in `.superpowers/`, which DittoFS gitignores), so they are added here under `docs/sdd/` and would not be part of a merge.
 
@@ -445,7 +445,7 @@ An earlier version of this section reported 52 identical and 1 differing — the
 
 (Whole-tree hashes necessarily differ — the branch has 3,332 files and this extraction has the 88 the NBD work touches. What matters for a patch is that every one of those blobs is identical.)
 
-**The history is 117 commits** — the same commits, same authors, same timestamps, same messages, in the same order — replayed onto DittoFS. Unrelated upstream commits that the extraction would otherwise have carried are dropped; nothing about the NBD work is lost.
+**The history is 119 commits** — the same commits, same authors, same timestamps, same messages, in the same order — replayed onto DittoFS. Unrelated upstream commits that the extraction would otherwise have carried are dropped; nothing about the NBD work is lost.
 
 ### The base is `develop`'s tip, not a release tag
 
@@ -494,7 +494,7 @@ CONFLICT (add/add): Merge conflict in internal/adapter/common/payload_operation.
 CONFLICT (add/add): Merge conflict in README.md
 ```
 
-Three of the 117 commits touch `README.md`, `LICENSE` or `.gitattributes`, which are **extraction-only** files: this repository's README describes the extraction, and DittoFS has its own. A cherry-pick has to reconcile them, and the only correct reconciliation is "keep upstream's" — at which point the commit is empty. The `.gitignore` conflict is the same story from the other side: both sides append to the end of the file, so git has no way to order them.
+Three of the 119 commits touch `README.md`, `LICENSE` or `.gitattributes`, which are **extraction-only** files: this repository's README describes the extraction, and DittoFS has its own. A cherry-pick has to reconcile them, and the only correct reconciliation is "keep upstream's" — at which point the commit is empty. The `.gitignore` conflict is the same story from the other side: both sides append to the end of the file, so git has no way to order them.
 
 The overlay avoids all of it: apply the **files**, which is what a patch is, and skip the commits whose content is extraction-only.
 
