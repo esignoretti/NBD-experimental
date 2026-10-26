@@ -2224,3 +2224,150 @@ TRIM and WRITE_ZEROES), and put the FLUSH barrier inside `handleFlush`, where it
 would have deadlocked the pool it was part of. All three were corrected before
 execution. Where the plan and the code disagreed during execution, the code won,
 and the difference is recorded in the commit that resolved it.
+
+---
+
+## The snapshot feature: boot a volume's snapshot, rehydrate it into a new one
+
+The branch's last major piece of work, and the only one that was designed before
+it was built. It started from a question about backups — "I want a crash-consistent
+snapshot of the whole VM every few minutes" — and the first finding was that
+DittoFS already had snapshots. The work was not building snapshots; it was
+exposing them to a block-device client.
+
+Design: `docs/superpowers/specs/2026-10-22-nbd-volume-snapshots-design.md`.
+
+### What already existed, and what did not
+
+`Runtime.CreateSnapshot` already produced a share-scoped, crash-consistent copy:
+it drains in-flight work, dumps the metadata store, and writes a manifest of the
+chunks the dump references. Chunks are content-addressed, so a snapshot costs
+little more than what changed. What did not exist was any way for a **client** to
+read one, and any way to get one back as a volume.
+
+### The design was reviewed before it was built, and the review mattered
+
+Two flaws in the first draft would each have shipped a broken feature:
+
+**NBD flags are written once, at handshake.** The draft said promotion to
+read-write would "clear `NBD_FLAG_READ_ONLY`". `Export.TransmissionFlags()` is
+serialized into the greeting and never re-read, so a client that saw the
+read-only bit will not send writes no matter what the server does later. Promotion
+is a **reconnect**, and the design now says so instead of implying a switch.
+
+**`Export` is not a place to hold mutable state.** `RuntimeExporter.Resolve`
+builds a fresh `Export` on every call and `serve` keeps one copy for the
+connection's lifetime, so mutating `exp.ReadOnly` changes one connection's view
+and nothing re-reads it.
+
+A second review pass found eight more, of which two changed the architecture:
+
+**A private metadata service per snapshot.** Registering the replayed store in
+the production service under a synthetic share name forks the lock manager, the
+notifier, the quota row and the writeback flag over one namespace
+(`pkg/metadata/service.go:1016,1075,1097,1102`). It also cannot be made to work:
+file handles are `"<shareName>:<uuid>"` bounded by `MaxFileHandleSize` 64, and a
+36-character UUID plus a path is 81 bytes. So a snapshot gets its own
+`metadata.Service`, and its handle is minted from the replayed store's own rows.
+
+**The shadow's `RemoteSync` must be built over the replayed store.** Pointing it
+at production's store would hydrate production's bytes into a snapshot export —
+silently, and only for chunks that were not already local. This is the single
+most dangerous wiring mistake in the feature, and the test that catches it is a
+byte comparison, not a status check.
+
+### What was built
+
+| Commit | What |
+|---|---|
+| `725a93e8` | `engine.Store.SetEvictionAllowed` — a read-only store may evict on its own authority. Without it a shadow with a cap fails a large boot with `ErrLocalStoreFull` and there is nothing to evict. |
+| `e5494856` | `Runtime.OpenSnapshot` / the open registry, and a delete that refuses a snapshot an export holds (`ErrSnapshotOpen`, 409). |
+| `ba94945c` | `OpenSnapshotAsExport`: replay the dump, build the shadow store and its private service. |
+| `e2d25328` | The NBD side: `<share>/snapshots/<id>/<volume>` claimed **before** the production split, `Export.Meta`/`store`/`closeFn`, `Handler.metaFor`/`storeFor`. |
+| `a4f81be3` | `RehydrateSnapshot` — copy a snapshot into a new, independent, writable volume. |
+| `611c8ab9` | The usage report: what each snapshot holds, what a delete frees. |
+| `6e9515b5`, `6787aa20` | REST and `dfsctl` for usage and rehydrate. |
+| `6d922a21` | The GC-survival test, and two bugs it found. |
+| `61768734` | `boot-qemu.sh --export <snapshot shape>`, and the boot that proves it. |
+
+### Bugs the tests found, in the order they were found
+
+**`OpenSnapshotExport.Close` was a data race.** Idempotent is not the same as
+concurrency-safe: the connection's deferred release and the test's cleanup both
+cleared the same fields. Fixed with a `sync.Once`.
+
+**The rehydrate job published `done` before releasing its hold.** A caller that
+polled to `done` and immediately deleted the snapshot was refused with "held open
+by 1". `runRehydrate` now *returns* the terminal state; the goroutine releases
+the hold, then publishes.
+
+**The usage report filtered snapshots before reading their manifests.** Every
+chunk of the reported snapshot then looked unique, so the report claimed a delete
+frees everything when it frees nothing. Manifests are always all read now; the
+filter applies only to what is reported.
+
+**One volume name cannot identify two volumes.** The first `RehydrateSnapshot`
+signature took a single `volume`, which made the snapshot's source and the new
+destination the same name. A snapshot is share-scoped and holds every volume in
+the share, so the API takes `srcVolume` and `dstVolume`.
+
+**The volume layout was assumed.** Both the shadow resolver and the rehydrate
+resolver assumed `<share>/volumes/<volume>`; the test fixtures keep files at the
+share root. Both now try `volumes/` and fall back.
+
+### Two traps that made tests pass for the wrong reason
+
+**Three layers refuse a read-only write, so one removal proves nothing.** A write
+to a snapshot is refused by `validateWrite`, by `handleWriteZeroes`/`handleDiscard`,
+and by `AuthContext.ShareReadOnly` in the metadata layer. The first version of
+`TestSnapshotExport_RefusesEveryWrite` passed with the handler's check *deleted* —
+because the fixture's volume is owned by uid 1000 and the adapter's identity is
+65534, so ordinary ownership denied the write anyway. The test now carries a
+positive control: the same identity first writes successfully to the production
+export, which proves the identity is authorized before the refusal is attributed
+to read-only.
+
+**"GC swept nothing" is also what a broken GC reports.** The GC-survival test
+rehydrates, deletes the snapshot, runs GC with a zero grace period, and reads the
+volume back — which passes whether the chunks survived or the sweep never ran. It
+carries a negative control: deleting the rehydrated volume too must make the same
+chunks sweepable (measured 0 swept with the volume present, 2 swept and
+2 097 260 bytes freed once it was gone).
+
+### The end-to-end demonstration
+
+Run on 2026-10-25 against a 1 GiB volume whose first boot formatted it and wrote
+`hello.txt`:
+
+1. Boot the volume: `VERDICT: PASS`.
+2. `Runtime.CreateSnapshot` — the production path — reaches `ready`, 9 chunks.
+3. Boot `<share>/snapshots/<id>/boot`: mounts, reads `hello.txt`, `VERDICT: PASS`.
+4. Overwrite production's ext4 superblock with 1024 bytes of `0xdeadbeef` at
+   offset 1024, over the NBD protocol. Production confirmed unbootable
+   (`mount /dev/nbd0 failed`).
+5. Boot the same snapshot again: still mounts, still reads `hello.txt`.
+
+Two rig changes were needed and both are properties of snapshots, not workarounds:
+the pre-boot `volumes/` check is skipped for a snapshot export (its volume is
+deliberately not a file on the share), and the guest mounts `-o noload,ro`
+because ext4 will not replay a journal on a read-only device and a snapshot's
+journal is dirty for a legitimate reason.
+
+### What this record is careful about
+
+**The shadow store is not itself write-refusing.** A direct `WriteAt` on it
+succeeds; the guarantee lives in the handler. Unreachable today because every
+write command is refused before the store is touched, but it is defense in depth,
+not a property of the store, and it is the layer to re-check if another caller is
+ever added.
+
+**Cold reads off a snapshot are slow and were not timed.** Every chunk a boot
+touches is hydrated; a single cold 4 KiB read costs 13.75 ms on the S3-backed
+host. A full snapshot boot has never been timed, so no figure is claimed.
+
+**Three things are deliberately unbuilt**, each a decision rather than an
+omission: cross-share rehydration (needs the dump resolved under another share's
+name), byte accounting in the usage report (a manifest line is a hash with no
+size; that would need one remote HEAD per distinct chunk), and a `snapshot open`
+CLI verb (serving a snapshot is a client connecting to a name, not an operator
+action).

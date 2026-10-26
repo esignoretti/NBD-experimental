@@ -2,11 +2,11 @@
 
 An NBD (Network Block Device) adapter for [DittoFS](https://github.com/marmos91/dittofs), extracted for review and merge proposal.
 
-**Status:** a working prototype, now pipelined. The protocol is implemented end to end, it has booted a real kernel from a real export, and it serves several commands per connection concurrently — depth 16 measures 1.45× what the serialized dispatcher reached. It is still not production-ready: no CI job runs the kernel-boot rig, and a handful of minors are recorded but unfixed. Five defects found by review and by running the rig are fixed here. Never merged upstream. See [Status](#status) and [`docs/nbd-benchmarks.md`](docs/nbd-benchmarks.md).
+**Status:** a working prototype, now pipelined and snapshot-capable. The protocol is implemented end to end, it has booted a real kernel from a real export, it serves several commands per connection concurrently — depth 16 measures 1.45× what the serialized dispatcher reached — and a VM can boot from a **snapshot** of its own volume while the production volume keeps running. It is still not production-ready: no CI job runs the kernel-boot rig, buffer pooling is unbuilt, and a handful of minors are recorded. Nine defects found by review and by running the rigs are fixed here. Never merged upstream. See [Status](#status) and [`docs/nbd-benchmarks.md`](docs/nbd-benchmarks.md).
 
-**This is not a standalone project.** It is an extraction of one feature branch — 103 commits — from the DittoFS repository. Every file sits at its exact upstream path so that the commits apply 1:1 to DittoFS. See [Merging upstream](#merging-upstream).
+**This is not a standalone project.** It is an extraction of one feature branch — 116 commits — from the DittoFS repository. Every file sits at its exact upstream path, so a merge is a file overlay rather than a patch series — see [Merging upstream](#merging-upstream).
 
-**What is here and what is not.** The 53 files this branch touches are extracted verbatim; the rest of DittoFS is not included, so this repository does not build on its own and has no `go.mod`. That is deliberate — it is a patch set with documentation, not a fork. `docs/sdd/` is the exception: those artifacts were never tracked upstream (they lived in `.superpowers/`, which DittoFS gitignores), so they are added here under `docs/sdd/` and would not be part of a merge.
+**What is here and what is not.** The 86 files this branch touches are extracted verbatim; the rest of DittoFS is not included, so this repository does not build on its own and has no `go.mod`. That is deliberate — it is a patch set with documentation, not a fork. `docs/sdd/` is the exception: those artifacts were never tracked upstream (they lived in `.superpowers/`, which DittoFS gitignores), so they are added here under `docs/sdd/` and would not be part of a merge.
 
 ---
 
@@ -36,6 +36,8 @@ NBD client  ──►  internal/adapter/nbd/  ──►  block engine  ──►
 | Read-only exports | ✅ |
 | `CAN_MULTI_CONN` — several connections, coherent across them | ✅ |
 | Payload-length enforcement (advertised 32 MiB maximum) | ✅ |
+| Pipelining — several commands in flight per connection | ✅ |
+| Volume snapshots — boot a VM from one, rehydrate one into a new volume | ✅ |
 | `BLOCK_STATUS`, structured replies, meta-context, `STARTTLS` | ❌ out of scope by design |
 
 `CAN_MULTI_CONN` is advertised because the flag's condition holds structurally, not because it was configured: the wire layer holds no cache, and the block store is resolved per *share*, so every connection to one export reaches the same journal and the same per-file flush locks. A `FLUSH` or FUA on one connection is therefore a barrier over bytes another connection wrote. Two tests pin this — `TestIntegration_OneBlockStorePerShare` (every resolution returns the same `*engine.Store`) and `TestIntegration_FlushOnOneConnectionCoversAWriteOnAnother` (a write on one connection is visible through a `FLUSH` on a second) — and the second was verified to fail when the store is deliberately made per-connection.
@@ -62,6 +64,20 @@ theirs-only  = 0x0c00     (SEND_CACHE and SEND_FAST_ZERO, which we deliberately 
 **A crash/reconnect mechanism proven end to end.** `test/nbd/crash-restart.sh` SIGKILLs the server mid-flight, proves the kernel client's I/O *pauses* rather than failing, then restarts the server inside the window and proves the read *resumes with the pre-crash bytes*. It passes, and its negative control fails in exactly the way it must. Getting there required an `nbd-client` built from upstream `master`: 3.26.1 has no `-T` at all, and 3.27.1's persist is silently dead on the netlink path (`persist_mode` is never assigned `true`). Transcripts in [`docs/nbd-benchmarks.md`](docs/nbd-benchmarks.md).
 
 **And pipelining does not weaken it.** The obvious worry about allowing several commands in flight is that a crash loses more than one request while `-t` requeues only the one whose timer fired. Measured with `iodepth=8` against the fixture killed mid-flight: 8 requests outstanding at the kill (`/sys/block/nbdN/inflight`), `err=0`, and a **sequential** verify of all 4 096 blocks afterwards was crc32c-clean. Each request carries its own block-layer timer, so this follows from `nbd_xmit_timeout` taking `cmd->lock` for one command at a time, not from luck. Two traps: don't count `Connection timed out, retrying` lines (rate-limited, `dev_err_ratelimited`), and don't verify with random reads (600 of 4 096 blocks — a corrupted block is usually never visited, which a deliberate-corruption control proved).
+
+**A VM booted from a snapshot while production stayed live, and survived production's destruction.** This is the strongest claim in this repository, and it was run end to end on 2026-10-25:
+
+1. A 1 GiB volume was exported over NBD and a real kernel booted from it, formatting it and writing `hello.txt` (`VERDICT: PASS`).
+2. A snapshot was taken through `Runtime.CreateSnapshot` — the production code path, not a fixture — reaching state `ready` with 9 chunks.
+3. The snapshot was booted as its own export, `<share>/snapshots/<id>/<volume>`. A different VM, a different kernel instance, mounted it and read `hello.txt` back (`VERDICT: PASS`).
+4. Production's ext4 superblock was then overwritten with 1 024 bytes of `0xdeadbeef` at offset 1 024 through the NBD protocol. Production was confirmed **unbootable** (`mount /dev/nbd0 failed`).
+5. The same snapshot booted again, still mounted, still read `hello.txt` back.
+
+So the snapshot is not a view of the live volume. A write sent to the snapshot export was answered `EPERM`, and the handshake advertises `NBD_FLAG_READ_ONLY` (`0x016f` versus production's `0x016d` — the read-only bit is the only difference).
+
+Two things had to change in the rig for this, both of which are properties of snapshots rather than workarounds. A snapshot's volume is deliberately **not** a file on the share — it is served from the snapshot's own replayed metadata — so the pre-boot check that walks `volumes/` had to be skipped for the snapshot export shape. And the guest mounts with **`-o noload,ro`**: ext4 refuses to replay a journal on a read-only device, and a snapshot's journal is dirty for a legitimate reason, because the boot it froze wrote and powered off without unmounting. That is exactly the crash-consistent case a snapshot exists for.
+
+**A rehydrated volume's chunks are its own, not borrowed.** `TestRehydratedVolumeSurvivesTheSnapshotBeingDeleted` rehydrates a volume, deletes the snapshot, runs GC with a **zero grace period**, and reads the volume back. It carries a negative control, because "GC swept nothing" is also what a broken GC reports: deleting the rehydrated volume too must make the same chunks sweepable (measured 0 swept with the volume present, 2 swept and 2 097 260 bytes freed once it was gone). Without that control the survival assertion would pass for two reasons and prove neither.
 
 ### Measured performance
 
@@ -129,6 +145,31 @@ had been committed by the time a FLUSH was handled. A pool breaks that argument,
 the guarantee is explicit — a pending-write counter that FLUSH waits on, before it
 is queued, on the reader goroutine.
 
+**Volume snapshots — boot one, rehydrate one.** A snapshot is a share-scoped,
+crash-consistent copy: `Runtime.CreateSnapshot` drains in-flight work, dumps the
+metadata store and writes a manifest of the chunks it references, which is why a
+snapshot costs little more than the chunks that changed since the last one. Three
+things were missing for a VM operator to use that, and all three are built here.
+
+The design document ([`docs/superpowers/specs/2026-10-22-nbd-volume-snapshots-design.md`](docs/superpowers/specs/2026-10-22-nbd-volume-snapshots-design.md))
+was written first and then attacked: the review that followed found eight flaws,
+including two that would have shipped a broken feature (NBD flags are written once
+at handshake, so "flip the export to read-write" cannot work — a client must
+reconnect; and `Export` is rebuilt on every resolve, so it is not a place to hold
+mutable state). The final design is the one implemented.
+
+| Capability | What it does | Where |
+|---|---|---|
+| **Boot a snapshot** | A client connects to `<share>/snapshots/<id>/<volume>` and gets the snapshot's bytes, read-only. The exporter claims that name shape before the production split, opens the snapshot as a shadow store, and serves it through a **private** `metadata.Service` — registering the replayed store in the production service under a synthetic name would fork the lock manager and the quota row for one namespace, and a 36-char UUID does not fit in a 64-byte file handle anyway. | `internal/adapter/nbd/snapshot.go`, `Export.Meta`/`store`/`closeFn`, `Handler.metaFor`/`storeFor` |
+| **Shadow store** | The snapshot's `metadata.dump` is replayed into a fresh Badger instance and a `RemoteSync` is built **over the replayed store**, so cold reads hydrate the snapshot's chunks. Pointing it at production's store would hydrate production's bytes into a snapshot export. The journal is evictable (`SetEvictionAllowed`), because a cap without eviction turns a large boot into `ErrLocalStoreFull`. | `pkg/controlplane/runtime/snapshot_shadow.go` |
+| **Refuse a delete while open** | Deleting a snapshot an export is serving is refused with `ErrSnapshotOpen` (409), per snapshot, not per share. | `pkg/controlplane/runtime/snapshot_open.go` |
+| **Rehydrate** | Copies a snapshot into a **new, independent, writable** volume: replay, then copy the payload into a new `PayloadID` inside a metadata transaction. Detached job with states (`pending`/`replaying`/`copying`/`done`/`failed`), pollable, `--wait` optional. | `pkg/controlplane/runtime/snapshot_rehydrate.go`, `POST .../snapshots/{id}/rehydrate`, `dfsctl share snapshot rehydrate` |
+| **Usage report** | What each snapshot holds and what deleting it would free: total chunks, the sum across snapshots, how many are unique to some snapshot. Counts, not bytes, because a manifest line is a hash with no size. | `pkg/controlplane/runtime/snapshot_usage.go`, `GET .../snapshots/usage`, `dfsctl share snapshot usage` |
+
+The read-only guarantee is enforced in three independent layers, and that redundancy is deliberate — but it means an over-the-wire test of "a write is refused" passes with any one layer removed. The test therefore carries a **positive control**: the same identity first writes successfully to the production export, because a refusal caused by ordinary ownership permissions is otherwise indistinguishable from one caused by read-only.
+
+One honest limitation, verified rather than assumed: **the shadow `engine.Store` is not itself write-refusing.** A direct `WriteAt` on it succeeds. Nothing reaches it that way today — every write command is refused before the store is touched — but the guarantee lives in the handler, not in the store, and that is the layer to re-check if a future caller is added.
+
 ### Defects found by running it, not by reading it
 
 **A data race in `pkg/metadata`, reachable only now that dispatch is concurrent.**
@@ -154,6 +195,17 @@ plain `select` over `{send, ctx.Done()}`. When both are ready Go picks randomly,
 and during a drain both always are — so roughly half the replies of a draining
 connection were dropped by their own escape hatch and the client got `EOF` where it
 should have got an answer.
+
+**The rehydrate job published `done` before releasing its snapshot hold.** A caller
+that polled to `done` and immediately deleted the snapshot was refused with "held
+open by 1" — a window microseconds wide that would have read as "you cannot delete
+what you just rehydrated". `runRehydrate` now returns the terminal state instead of
+publishing it, and the goroutine releases the hold *then* publishes.
+
+**The usage report filtered snapshots before reading their manifests.** Every chunk
+of the reported snapshot therefore looked unique, so the report claimed a delete
+frees everything when it frees nothing. Manifests are now always all read; the
+filter applies only to what is reported.
 
 ### Open work
 
@@ -197,6 +249,29 @@ p50). That is a cache-configuration finding, not an adapter one — but it needs
 own investigation before any number from that host means anything. Detail in
 `docs/nbd-benchmarks.md` §5.
 
+**5. Snapshots are bootable and rehydratable, but three things are deliberately
+unbuilt.** Each is a decision, not an omission:
+
+- **Cross-share rehydration.** A snapshot is readable only through its own share's
+  metadata dump, so copying into a *different* share needs that dump resolved under
+  the other share's name — a second routing decision, not a parameter. Same-share
+  covers the stated goal (restore a VM into a fresh volume).
+- **Byte accounting in the usage report.** A manifest line is a hash with no size;
+  bytes would need one remote HEAD per distinct chunk. Counts are exact and local;
+  `bytes_freed` from `gc-status` after a real delete is the byte answer.
+- **A `snapshot open` CLI verb.** Serving a snapshot is not something an operator
+  does — it happens because a client connects to `<share>/snapshots/<id>/<volume>`.
+  A verb that only minted a name would be a no-op with a flag.
+
+**6. Cold reads off a snapshot are slow and unmeasured end to end.** A boot hydrates
+ every chunk it touches; on the S3-backed host a single cold 4 KiB read costs
+13.75 ms (measured). A full snapshot boot has not been timed, so no figure is
+claimed here. Two costs are inherent and stated rather than fixed: the shadow
+journal is a second hydration cache on the same volume production writes to, and
+`metadata.dump` is replayed row by row on **every** open and every rehydrate —
+deliberately uncached, because a cache would need invalidation on delete and would
+pin memory for snapshots nobody is booting.
+
 ### Known minor issues
 
 Every item the review recorded is now closed. What remains is one capability
@@ -227,20 +302,34 @@ In the parent repository, at the branch tip:
 go build ./...                                          OK
 go vet ./...                                             clean
 gofmt -l (both NBD packages)                             clean
-go test -race -count=1 (both packages)                   ok 14.4s / ok 3.8s
+go test -race -count=1 (both packages)                   ok 17.7s / ok 3.9s
 go test -run Oracle                                      both PASS
 go test -race ./internal/adapter/... ./pkg/adapter/... ./pkg/metadata/...
                                                          63 packages ok, 0 failures
 ```
 
-**And re-verified as a merge into v0.36.0**, which is the state a reviewer would actually get — see [Merging upstream](#merging-upstream). `go build ./...` passes, both NBD packages pass, and 63 of 63 adapter and metadata packages pass.
+**The snapshot work adds five more packages, all green:**
 
-**123 test functions and 5 benchmarks** across 16 test files: 4,949 lines of
-tests against 2,768 lines of production code in `internal/adapter/nbd`, plus 502
-against 457 in `pkg/adapter/nbd`. The rig under `test/nbd/` is another 2,257
-lines of shell. (Before this branch's cleanup the split was 97 test functions
-across 9 files, 3,758 test lines against 1,880 production — the production code
-grew by the pipeline and the tests grew faster.)
+```
+./pkg/controlplane/runtime                       ok 205.7s   (was 135.3s before snapshots)
+./internal/controlplane/api/handlers             ok   6.0s
+./cmd/dfsctl/commands/share/snapshot             ok   2.6s
+./pkg/block/engine                               ok 183.4s
+./internal/adapter/nbd                           ok   9.2s
+```
+
+**And re-verified as an overlay onto `develop`'s tip** (`176be82e`), which is the state a reviewer would actually get — see [Merging upstream](#merging-upstream). `go build ./...` passes, `go vet` is clean on the five touched packages, both NBD packages pass, and every package under `./internal/adapter/...`, `./pkg/adapter/...`, `./pkg/controlplane/runtime/...`, `./internal/controlplane/api/handlers/...` and `./cmd/dfsctl/commands/share/snapshot/...` passes with zero failures.
+
+That base is not v0.36.0, and the reason is recorded in [Merging upstream](#merging-upstream): one of the 86 files calls a function that arrived upstream after the release, so the extraction can no longer be pinned to a tag.
+
+**181 test functions and 5 benchmarks** across 27 test files. The NBD adapter is
+5,837 lines of tests against 2,947 lines of production code in
+`internal/adapter/nbd`, plus 502 against 457 in `pkg/adapter/nbd`. The snapshot
+runtime is another 1,369 lines of tests against 1,351 of production across
+`snapshot_open`, `snapshot_shadow`, `snapshot_rehydrate` and `snapshot_usage`. The
+rig under `test/nbd/` is 3,480 lines of shell and documentation. (Before the
+pipelining work the adapter split was 97 test functions across 9 files, 3,758 test
+lines against 1,880 production.)
 
 ---
 
@@ -249,7 +338,7 @@ grew by the pipeline and the tests grew faster.)
 Every path below is where the file lives in DittoFS, unchanged.
 
 ```
-internal/adapter/nbd/           7,717 LOC — the wire layer (2,768 prod + 4,949 test)
+internal/adapter/nbd/           8,784 LOC — the wire layer (2,947 prod + 5,837 test)
   protocol.go                     wire codec: magics, header encode/decode
   handshake.go                    greeting, option haggling, export resolution
   connection.go                   Conn, Handler, BlockStore; serve hands off to pipeline
@@ -258,6 +347,8 @@ internal/adapter/nbd/           7,717 LOC — the wire layer (2,768 prod + 4,949
   handlers_write.go               NBD_CMD_WRITE, TRIM, WRITE_ZEROES, payload drain
   handlers_control.go             NBD_CMD_FLUSH, the durability barrier
   volume.go                       RuntimeExporter: <share>/<volume> → Export
+  snapshot.go                     ⚠ the snapshot export shape, claimed before the
+                                  production split: <share>/snapshots/<id>/<volume>
   payload_size.go                 the advertised-maximum bound
   reply.go                        reply writers
   reply_value.go                  the reply value handlers return instead of writing
@@ -267,9 +358,21 @@ pkg/adapter/nbd/                  959 LOC — the framework side (457 prod + 502
   config.go                       Config, defaults, validation
   healthcheck.go                  degraded-export reporting
 
+pkg/controlplane/runtime/         the snapshot machinery
+  snapshot_open.go                open-snapshot registry; refuses a delete while held
+  snapshot_shadow.go              replay a snapshot into a shadow store + service
+  snapshot_rehydrate.go           copy a snapshot into a new writable volume (job)
+  snapshot_usage.go               what each snapshot holds, what a delete frees
+
+internal/controlplane/api/handlers/snapshot.go   REST: list, create, delete,
+                                  usage, rehydrate, rehydrate-status
+cmd/dfsctl/commands/share/snapshot/              CLI: create, list, delete,
+                                  usage, rehydrate, rehydrate-status
+
 test/nbd/                        the proof rigs
-  README.md                       32 KB: topology, every command, every finding
-  boot-qemu.sh                    40 KB: boots a real kernel from an export
+  README.md                       42 KB: topology, every command, every finding
+  boot-qemu.sh                    43 KB: boots a real kernel from an export
+                                  (a volume, or a snapshot via --snapshot-export)
   crash-restart.sh                36 KB: server-down/reconnect (needs Linux+root)
   bench-fio.sh                    depth sweep, sequential, fsync-per-4KiB
   fetch-artifacts.sh              20 KB: downloads the kernel + nbd.ko
@@ -279,7 +382,8 @@ test/nbd/                        the proof rigs
 
 docs/nbd-benchmarks.md           ⚠ added here: every measured result, with method
                                  and the traps that produce wrong numbers
-docs/superpowers/specs/          the design spec (§1–§13)
+docs/nbd-block-status.md         ⚠ added here: why BLOCK_STATUS is refused
+docs/superpowers/specs/          the design spec (§1–§13) and the snapshot design
 docs/superpowers/plans/          the 8-task implementation plan, and the pipelining plan
 docs/sdd/                        ⚠ added here, not upstream: the SDD record —
                                  briefs, reports, review diffs, progress ledger
@@ -301,6 +405,13 @@ modified, and they are why a merge needs care:
 | `internal/adapter/common/read_payload.go`, `payload_operation.go`, `doc.go` | shared helpers the NBD handlers reuse |
 | `internal/adapter/nfs/v4/handlers/content_errmap_wiring_test.go` | test adjusted for the shared helper |
 | `pkg/metadata/pending_writes.go` | **a real data race**, exposed by pipelining: `RecordWrite` returned a pointer into its own map, read after the lock was released |
+| `pkg/block/engine/engine.go`, `health.go` | `SetEvictionAllowed` — a read-only store may evict on its own authority, so a snapshot shadow with a cap cannot fill up |
+| `pkg/controlplane/runtime/runtime.go` | the open-snapshot registry and the rehydrate registry on `Runtime` |
+| `pkg/controlplane/runtime/snapshot.go` | delete refuses a snapshot an export holds open |
+| `pkg/controlplane/runtime/shares/blockstore_config.go` | the config a shadow store is built from |
+| `pkg/controlplane/models/errors.go` | `ErrSnapshotOpen` |
+| `pkg/controlplane/api/router.go`, `dto/snapshot.go`, `pkg/apiclient/snapshots.go` | the usage and rehydrate endpoints |
+| `cmd/dfsctl/commands/share/snapshot/` | `usage`, `rehydrate`, `rehydrate-status` |
 | `.github/workflows/integration-tests.yml` | installs `qemu-utils` and runs the NBD oracle |
 | `test/required-tests.json` | four NBD gates pinned |
 | `.gitignore` | `test/nbd/artifacts/` (56 MB of downloaded kernel + modules) |
@@ -323,45 +434,73 @@ Two of these are genuine bug fixes that affect NFS and SMB too:
 
 The point of this repository is to make a merge proposal possible, so the history was reconstructed to make one clean.
 
-**All 53 files the branch touches are byte-identical to the original branch**, except one deliberate difference. Verified per file against `nbd-on-036`:
+**All 86 files the branch touches are byte-identical to the original branch.** Verified per file against `nbd-on-036`:
 
 ```
-files in branch: 53
-IDENTICAL: 52  DIFFERS: 1  MISSING: 0
-  DIFF test/nbd/deploy/config-server2.yaml
+files in branch: 86
+IDENTICAL: 86  DIFFERS: 0  MISSING: 0
 ```
 
-The one difference is the redaction: that file carried the live deployment's public address and JWT secret. It is the only file that differs, and it differs on purpose.
+An earlier version of this section reported 52 identical and 1 differing — the redacted `test/nbd/deploy/config-server2.yaml`. That file has since been redacted **on the branch too** (`0c50d9ce` here; `aabca47e` in the source branch, where the history was rewritten to purge the secret from the published fork), so the extraction and the branch are now the same bytes everywhere.
 
-(Whole-tree hashes necessarily differ — the original branch has 3,305 files and this extraction has the 53 the NBD work touches. What matters for a patch is that every one of those blobs is identical.)
+(Whole-tree hashes necessarily differ — the branch has 3,332 files and this extraction has the 86 the NBD work touches. What matters for a patch is that every one of those blobs is identical.)
 
-**The history is 103 NBD commits** — the same commits, same authors, same timestamps, same messages, in the same order — replayed onto DittoFS **v0.36.0** (`51fc8443`). Unrelated upstream commits that the extraction would otherwise have carried are dropped; nothing about the NBD work is lost.
+**The history is 116 commits** — the same commits, same authors, same timestamps, same messages, in the same order — replayed onto DittoFS. Unrelated upstream commits that the extraction would otherwise have carried are dropped; nothing about the NBD work is lost.
 
-**The merge was tested, not assumed.** The result is not "the patches apply"; it is a tree that builds and passes at the base. Overlaying the branch's 53 files onto v0.36.0 and resolving one conflict:
+### The base is `develop`'s tip, not a release tag
 
-```
-go build ./...                                              PASS
-go test ./internal/adapter/nbd/ ./pkg/adapter/nbd/          ok 8.2s / ok 1.7s
-go test ./internal/adapter/... ./pkg/adapter/... ./pkg/metadata/...
-                                                            63 packages ok, 0 failures
-```
-
-**The one conflict** is a rename collision. v0.36.0 has the lowercase `normalizeBlockStoreError(err)`; this branch exported it to `NormalizeBlockStoreError(err)` in `feat(nbd): connection loop and READ handler`. Take the branch's name — that is the whole resolution.
-
-An earlier version of this section claimed the base was `f2183422` and that the range applied with two conflicts including `.gitignore`. Both were wrong, and the first was caught only by trying it:
+An earlier version of this section claimed the base was **v0.36.0** (`51fc8443`) and that the merge was verified there. That is no longer true, and the way it stopped being true is worth recording, because the same trap will catch the next person:
 
 ```
-internal/adapter/common/payload_operation.go:31:19:
-    blockStore.WithPayloadScope undefined (type *engine.Store has no field or method WithPayloadScope)
+$ git checkout 51fc8443 && <overlay the 86 files> && go build ./...
+pkg/controlplane/runtime/runtime.go:736:19: undefined: shares.RemoveShareJournal
 ```
 
-`WithPayloadScope` arrives upstream in `2a3d7f76` (#2958) and is refined by `68946fe3` (#3030), both ancestors of v0.36.0 and both dropped by the extraction as unrelated. The `.gitignore` conflict disappeared once the extraction stopped carrying that file at all. The real base is **v0.36.0** (`51fc8443`).
+`runtime.go` is one of the 86 files, and it calls `shares.RemoveShareJournal`. That function arrives upstream in `8acf6ff8` (#3200, "removing a share deletes its metadata, journal and local blocks"), which landed **after** v0.36.0. So the branch has moved on from the release the extraction was originally pinned to: **86 files of NBD work now sit on top of five upstream commits that are not in any release.**
 
-`go test ./...` has two failures, neither from this work: `test/harness/known` fails at the v0.36.0 baseline too (macOS bash 3.2 has no `declare -A`), and `TestBLAKE3FasterThanSHA256` is a load-sensitive benchmark gate on an untouched package (`pkg/block` is not among the 53 changed files) that passes when run alone.
+The verified base is therefore the tip of `develop` at extraction time:
+
+```
+$ git checkout 176be82e        # develop tip: "docs(rfc): offers carry each extent's version…"
+$ <overlay the 86 files>       # no conflicts — every file applies cleanly
+$ go build ./...               PASS
+$ go vet  (the five packages)  clean
+$ go test ./internal/adapter/nbd/ ./pkg/adapter/nbd/
+                               ok 8.8s / ok 1.9s
+$ go test ./internal/adapter/... ./pkg/adapter/... ./pkg/controlplane/runtime/... \
+          ./internal/controlplane/api/handlers/... ./cmd/dfsctl/commands/share/snapshot/...
+                               0 failures
+```
+
+And the claim that makes this base the right one: **the branch tree differs from `origin/develop` in exactly those 86 files, and in nothing else.** Checked as a set comparison, not by eye:
+
+```
+$ git diff --name-only origin/develop HEAD | wc -l
+86
+$ git diff --name-only origin/develop HEAD | sort | diff - <(the 86-file list) && echo IDENTICAL SETS
+IDENTICAL SETS
+```
+
+So the branch is `develop` plus this work, which is exactly what a merge proposal should be.
+
+### Why the overlay, and not `git cherry-pick`
+
+The obvious recipe — cherry-pick the range onto the base — does not work here, and the reason is structural rather than fixable:
+
+```
+$ git cherry-pick 62acc107..ext
+CONFLICT (content): Merge conflict in .gitignore
+CONFLICT (add/add): Merge conflict in internal/adapter/common/payload_operation.go
+CONFLICT (add/add): Merge conflict in README.md
+```
+
+Three of the 116 commits touch `README.md`, `LICENSE` or `.gitattributes`, which are **extraction-only** files: this repository's README describes the extraction, and DittoFS has its own. A cherry-pick has to reconcile them, and the only correct reconciliation is "keep upstream's" — at which point the commit is empty. The `.gitignore` conflict is the same story from the other side: both sides append to the end of the file, so git has no way to order them.
+
+The overlay avoids all of it: apply the **files**, which is what a patch is, and skip the commits whose content is extraction-only.
 
 ### What is in this repository but would not be part of a merge
 
-Five files exist to document the extraction and would collide with DittoFS's own on a naive merge:
+Six paths exist to document the extraction and would collide with DittoFS's own on a naive merge:
 
 | File | Why it must not merge |
 |---|---|
@@ -370,30 +509,39 @@ Five files exist to document the extraction and would collide with DittoFS's own
 | `.gitattributes` | pins line endings for this repo's contents |
 | `docs/nbd-benchmarks.md` | measured results for this branch, written for a reviewer |
 | `docs/nbd-block-status.md` | the BLOCK_STATUS refusal rationale, written for a reviewer |
-| `docs/sdd/` (32 files) | the SDD record; lived in `.superpowers/`, which DittoFS gitignores |
+| `docs/sdd/` (31 files) | the SDD record; lived in `.superpowers/`, which DittoFS gitignores |
 
-Apply the other 53 files and nothing else. The verification above did exactly that: it overlaid 53 files and skipped these 37, and confirmed afterwards that all 53 were byte-identical to the branch with zero mismatches.
+Apply the other 86 files and nothing else. The verification above did exactly that: it overlaid 86 files and skipped these 36, and confirmed afterwards that all 86 were byte-identical to the branch with zero mismatches.
 
 ### To propose the merge
 
 ```bash
 git clone https://github.com/marmos91/dittofs.git
 cd dittofs
-git checkout 51fc8443          # v0.36.0 — the verified base
+git checkout 176be82e          # develop tip at extraction time — the verified base
+
+# Apply the 86 files. Fetch this repository's tree and check out just those paths:
 git remote add nbd-exp https://github.com/esignoretti/NBD-experimental.git
 git fetch nbd-exp
 
-# 62acc10 is the baseline commit in this repository; the range is the 103 NBD commits.
-git cherry-pick 62acc10..nbd-exp/main
+# The file list, minus the six extraction-only paths:
+git ls-tree -r --name-only nbd-exp/main \
+  | grep -vE '^(README\.md|LICENSE|\.gitattributes)$' \
+  | grep -vE '^docs/(sdd/|nbd-benchmarks\.md|nbd-block-status\.md)' \
+  > /tmp/nbd-files.txt
+git checkout nbd-exp/main -- $(cat /tmp/nbd-files.txt)
 
-# Expect the rename conflict in payload_operation.go, resolve it as described, then:
 go build ./... && go test ./internal/adapter/nbd/ ./pkg/adapter/nbd/
 ```
 
 Two things to check that this repository cannot check for you:
 
-1. **The ten modified files may have moved on.** The merge was verified against `51fc8443`; if `write_payload.go`, `start.go` or `normalize.go` changed after v0.36.0, expect conflicts there. Re-verify each premise — the SDD ledger's own standing hazard is *"audits predate later fixes — re-verify each premise on develop."*
+1. **The base has moved again.** The merge was verified against `176be82e`. `develop` gains commits constantly; if any of the 86 files changed upstream after that point, expect conflicts there — and re-verify each premise, because the SDD ledger's own standing hazard is *"audits predate later fixes — re-verify each premise on develop."* The five commits between v0.36.0 and this base are a live example of exactly that.
 2. **`crash-restart.sh` has run end to end on a real Linux host, not just in a container.** It needs Linux, root and an `nbd-client` built from upstream master (3.26.1 has no `-T`; 3.27.1's `--persist` is silently dead). The run that first passed also found three defects in the script itself — a missing `-t`, a pre-flight that described the file rather than the running server, and no size cross-check — all fixed and described in [`docs/nbd-benchmarks.md`](docs/nbd-benchmarks.md).
+
+### `go test ./...` has two failures, neither from this work
+
+`test/harness/known` fails because macOS ships bash 3.2, which has no `declare -A`; it fails identically on an untouched checkout. `TestBLAKE3FasterThanSHA256` is a load-sensitive benchmark gate on `pkg/block`, a package this branch does not touch, and it passes when run alone.
 
 ## Credit
 
