@@ -443,7 +443,7 @@ IDENTICAL: 88  DIFFERS: 0  MISSING: 0
 
 An earlier version of this section reported 52 identical and 1 differing — the redacted `test/nbd/deploy/config-server2.yaml`. That file has since been redacted **on the branch too** (`0c50d9ce` here; `aabca47e` in the source branch, where the history was rewritten to purge the secret from the published fork), so the extraction and the branch are now the same bytes everywhere.
 
-(Whole-tree hashes necessarily differ — the branch has 3,332 files and this extraction has the 88 the NBD work touches. What matters for a patch is that every one of those blobs is identical.)
+(Whole-tree hashes necessarily differ — the branch has 3,335 files and this extraction has the 88 the NBD work touches. What matters for a patch is that every one of those blobs is identical.)
 
 **The history is every commit on the branch** — same authors, same timestamps, same messages, same order — replayed onto DittoFS. Unrelated upstream commits that the extraction would otherwise have carried are dropped; nothing about the NBD work is lost.
 
