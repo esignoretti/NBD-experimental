@@ -6,7 +6,7 @@ An NBD (Network Block Device) adapter for [DittoFS](https://github.com/marmos91/
 
 **This is not a standalone project.** It is an extraction of one feature branch — 116 commits — from the DittoFS repository. Every file sits at its exact upstream path, so a merge is a file overlay rather than a patch series — see [Merging upstream](#merging-upstream).
 
-**What is here and what is not.** The 86 files this branch touches are extracted verbatim; the rest of DittoFS is not included, so this repository does not build on its own and has no `go.mod`. That is deliberate — it is a patch set with documentation, not a fork. `docs/sdd/` is the exception: those artifacts were never tracked upstream (they lived in `.superpowers/`, which DittoFS gitignores), so they are added here under `docs/sdd/` and would not be part of a merge.
+**What is here and what is not.** The 88 files this branch touches are extracted verbatim; the rest of DittoFS is not included, so this repository does not build on its own and has no `go.mod`. That is deliberate — it is a patch set with documentation, not a fork. `docs/sdd/` is the exception: those artifacts were never tracked upstream (they lived in `.superpowers/`, which DittoFS gitignores), so they are added here under `docs/sdd/` and would not be part of a merge.
 
 ---
 
@@ -320,9 +320,9 @@ go test -race ./internal/adapter/... ./pkg/adapter/... ./pkg/metadata/...
 
 **And re-verified as an overlay onto `develop`'s tip** (`176be82e`), which is the state a reviewer would actually get — see [Merging upstream](#merging-upstream). `go build ./...` passes, `go vet` is clean on the five touched packages, both NBD packages pass, and every package under `./internal/adapter/...`, `./pkg/adapter/...`, `./pkg/controlplane/runtime/...`, `./internal/controlplane/api/handlers/...` and `./cmd/dfsctl/commands/share/snapshot/...` passes with zero failures.
 
-That base is not v0.36.0, and the reason is recorded in [Merging upstream](#merging-upstream): one of the 86 files calls a function that arrived upstream after the release, so the extraction can no longer be pinned to a tag.
+That base is not v0.36.0, and the reason is recorded in [Merging upstream](#merging-upstream): one of the 88 files calls a function that arrived upstream after the release, so the extraction can no longer be pinned to a tag.
 
-**181 test functions and 5 benchmarks** across 27 test files. The NBD adapter is
+**189 test functions and 5 benchmarks** across 29 test files. The NBD adapter is
 5,837 lines of tests against 2,947 lines of production code in
 `internal/adapter/nbd`, plus 502 against 457 in `pkg/adapter/nbd`. The snapshot
 runtime is another 1,369 lines of tests against 1,351 of production across
@@ -434,35 +434,35 @@ Two of these are genuine bug fixes that affect NFS and SMB too:
 
 The point of this repository is to make a merge proposal possible, so the history was reconstructed to make one clean.
 
-**All 86 files the branch touches are byte-identical to the original branch.** Verified per file against `nbd-on-036`:
+**All 88 files the branch touches are byte-identical to the original branch.** Verified per file against `nbd-on-036`:
 
 ```
-files in branch: 86
-IDENTICAL: 86  DIFFERS: 0  MISSING: 0
+files in branch: 88
+IDENTICAL: 88  DIFFERS: 0  MISSING: 0
 ```
 
 An earlier version of this section reported 52 identical and 1 differing — the redacted `test/nbd/deploy/config-server2.yaml`. That file has since been redacted **on the branch too** (`0c50d9ce` here; `aabca47e` in the source branch, where the history was rewritten to purge the secret from the published fork), so the extraction and the branch are now the same bytes everywhere.
 
-(Whole-tree hashes necessarily differ — the branch has 3,332 files and this extraction has the 86 the NBD work touches. What matters for a patch is that every one of those blobs is identical.)
+(Whole-tree hashes necessarily differ — the branch has 3,332 files and this extraction has the 88 the NBD work touches. What matters for a patch is that every one of those blobs is identical.)
 
-**The history is 116 commits** — the same commits, same authors, same timestamps, same messages, in the same order — replayed onto DittoFS. Unrelated upstream commits that the extraction would otherwise have carried are dropped; nothing about the NBD work is lost.
+**The history is 117 commits** — the same commits, same authors, same timestamps, same messages, in the same order — replayed onto DittoFS. Unrelated upstream commits that the extraction would otherwise have carried are dropped; nothing about the NBD work is lost.
 
 ### The base is `develop`'s tip, not a release tag
 
 An earlier version of this section claimed the base was **v0.36.0** (`51fc8443`) and that the merge was verified there. That is no longer true, and the way it stopped being true is worth recording, because the same trap will catch the next person:
 
 ```
-$ git checkout 51fc8443 && <overlay the 86 files> && go build ./...
+$ git checkout 51fc8443 && <overlay the 88 files> && go build ./...
 pkg/controlplane/runtime/runtime.go:736:19: undefined: shares.RemoveShareJournal
 ```
 
-`runtime.go` is one of the 86 files, and it calls `shares.RemoveShareJournal`. That function arrives upstream in `8acf6ff8` (#3200, "removing a share deletes its metadata, journal and local blocks"), which landed **after** v0.36.0. So the branch has moved on from the release the extraction was originally pinned to: **86 files of NBD work now sit on top of five upstream commits that are not in any release.**
+`runtime.go` is one of the 88 files, and it calls `shares.RemoveShareJournal`. That function arrives upstream in `8acf6ff8` (#3200, "removing a share deletes its metadata, journal and local blocks"), which landed **after** v0.36.0. So the branch has moved on from the release the extraction was originally pinned to: **88 files of NBD work now sit on top of five upstream commits that are not in any release.**
 
 The verified base is therefore the tip of `develop` at extraction time:
 
 ```
 $ git checkout 176be82e        # develop tip: "docs(rfc): offers carry each extent's version…"
-$ <overlay the 86 files>       # no conflicts — every file applies cleanly
+$ <overlay the 88 files>       # no conflicts — every file applies cleanly
 $ go build ./...               PASS
 $ go vet  (the five packages)  clean
 $ go test ./internal/adapter/nbd/ ./pkg/adapter/nbd/
@@ -472,12 +472,12 @@ $ go test ./internal/adapter/... ./pkg/adapter/... ./pkg/controlplane/runtime/..
                                0 failures
 ```
 
-And the claim that makes this base the right one: **the branch tree differs from `origin/develop` in exactly those 86 files, and in nothing else.** Checked as a set comparison, not by eye:
+And the claim that makes this base the right one: **the branch tree differs from `origin/develop` in exactly those 88 files, and in nothing else.** Checked as a set comparison, not by eye:
 
 ```
 $ git diff --name-only origin/develop HEAD | wc -l
-86
-$ git diff --name-only origin/develop HEAD | sort | diff - <(the 86-file list) && echo IDENTICAL SETS
+88
+$ git diff --name-only origin/develop HEAD | sort | diff - <(the 88-file list) && echo IDENTICAL SETS
 IDENTICAL SETS
 ```
 
@@ -494,7 +494,7 @@ CONFLICT (add/add): Merge conflict in internal/adapter/common/payload_operation.
 CONFLICT (add/add): Merge conflict in README.md
 ```
 
-Three of the 116 commits touch `README.md`, `LICENSE` or `.gitattributes`, which are **extraction-only** files: this repository's README describes the extraction, and DittoFS has its own. A cherry-pick has to reconcile them, and the only correct reconciliation is "keep upstream's" — at which point the commit is empty. The `.gitignore` conflict is the same story from the other side: both sides append to the end of the file, so git has no way to order them.
+Three of the 117 commits touch `README.md`, `LICENSE` or `.gitattributes`, which are **extraction-only** files: this repository's README describes the extraction, and DittoFS has its own. A cherry-pick has to reconcile them, and the only correct reconciliation is "keep upstream's" — at which point the commit is empty. The `.gitignore` conflict is the same story from the other side: both sides append to the end of the file, so git has no way to order them.
 
 The overlay avoids all of it: apply the **files**, which is what a patch is, and skip the commits whose content is extraction-only.
 
@@ -511,7 +511,7 @@ Six paths exist to document the extraction and would collide with DittoFS's own 
 | `docs/nbd-block-status.md` | the BLOCK_STATUS refusal rationale, written for a reviewer |
 | `docs/sdd/` (31 files) | the SDD record; lived in `.superpowers/`, which DittoFS gitignores |
 
-Apply the other 86 files and nothing else. The verification above did exactly that: it overlaid 86 files and skipped these 36, and confirmed afterwards that all 86 were byte-identical to the branch with zero mismatches.
+Apply the other 88 files and nothing else. The verification above did exactly that: it overlaid 88 files and skipped these 36, and confirmed afterwards that all 88 were byte-identical to the branch with zero mismatches.
 
 ### To propose the merge
 
@@ -520,7 +520,7 @@ git clone https://github.com/marmos91/dittofs.git
 cd dittofs
 git checkout 176be82e          # develop tip at extraction time — the verified base
 
-# Apply the 86 files. Fetch this repository's tree and check out just those paths:
+# Apply the 88 files. Fetch this repository's tree and check out just those paths:
 git remote add nbd-exp https://github.com/esignoretti/NBD-experimental.git
 git fetch nbd-exp
 
@@ -536,7 +536,7 @@ go build ./... && go test ./internal/adapter/nbd/ ./pkg/adapter/nbd/
 
 Two things to check that this repository cannot check for you:
 
-1. **The base has moved again.** The merge was verified against `176be82e`. `develop` gains commits constantly; if any of the 86 files changed upstream after that point, expect conflicts there — and re-verify each premise, because the SDD ledger's own standing hazard is *"audits predate later fixes — re-verify each premise on develop."* The five commits between v0.36.0 and this base are a live example of exactly that.
+1. **The base has moved again.** The merge was verified against `176be82e`. `develop` gains commits constantly; if any of the 88 files changed upstream after that point, expect conflicts there — and re-verify each premise, because the SDD ledger's own standing hazard is *"audits predate later fixes — re-verify each premise on develop."* The five commits between v0.36.0 and this base are a live example of exactly that.
 2. **`crash-restart.sh` has run end to end on a real Linux host, not just in a container.** It needs Linux, root and an `nbd-client` built from upstream master (3.26.1 has no `-T`; 3.27.1's `--persist` is silently dead). The run that first passed also found three defects in the script itself — a missing `-t`, a pre-flight that described the file rather than the running server, and no size cross-check — all fixed and described in [`docs/nbd-benchmarks.md`](docs/nbd-benchmarks.md).
 
 ### `go test ./...` has two failures, neither from this work

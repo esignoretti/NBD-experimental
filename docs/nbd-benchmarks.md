@@ -6,8 +6,14 @@ method is described alongside each table so you can judge the figure rather than
 Three results are worth reading even if you skip the tables:
 
 - **The depth plateau reproduces.** Random 4 KiB reads climb steeply to queue depth 4 and
-then gain nothing through depth 64. That is the measurement that motivates the pipelining
-work, and it is the one number in this document that should change when that work lands.
+then gain nothing through depth 64. That is the measurement that motivated the pipelining
+work, and the shape is what that work was then checked against. Pipelining landed after
+these figures were taken and moved the plateau rather than the floor: on the measuring host,
+serial dispatch reached 36,900 IOPS at depth 16 and stopped, while four workers with a byte
+budget reached 54,644 and were still climbing — 1.48x at depth 16, from a host whose
+run-to-run variance is 15-20%. The tables below are the **before** measurement, kept as
+such; the absolute numbers are not comparable to that A/B because it ran on different
+hardware.
 - **Crash/reconnect now passes end to end.** The rig existed but had never been executed;
   running it found a real bug in the rig itself (fixed in `37f03113`), and after the fix the
   test passes and its negative control fails in exactly the way it must.
@@ -25,7 +31,7 @@ work, and it is the one number in this document that should change when that wor
 | macOS arm64 | Go 1.27.2, `qemu-img`, `qemu-system-x86_64`, `qemu-nbd` 10.x |
 | Linux amd64 | 2 vCPU host, kernel 6.8, `nbd-client` built from upstream `master` (`9c69969`) |
 | Storage backends | RAM-backed fixture (isolates the adapter) and the live S3-backed server |
-| Code size | 6,288 lines — 2,234 production, 4,054 test; 97 test functions across 9 files |
+| Code size | 9,241 lines — 3,404 production, 5,837 test; 128 test functions across 18 files |
 
 Two backends are used deliberately. The RAM-backed fixture measures the adapter with the
 storage layer removed from the equation; the S3-backed server measures the whole system.
@@ -273,6 +279,12 @@ thoroughly commented, and its first real run produced a confidently wrong diagno
 
 ## 4. Performance: random 4 KiB reads by queue depth
 
+> **This section measures the adapter before pipelining.** It is kept because it is the
+> measurement that justified the work, and because the shape it records — a plateau at
+> depth 4 — is the thing pipelining was supposed to move. It moved. The after measurement
+> is at [the end of this section](#the-same-plateau-reproduced-in-a-unit-benchmark) and in
+> the commit that landed it; the tables here are not current performance.
+
 **Method.** `qemu-img bench` over the export, 10,000 operations of 4 KiB at `-t none`,
 best of 3, on the 2-vCPU Linux host against a RAM-backed fixture. Best of 3 because the
 first run of a series pays for connection setup and cold metadata.
@@ -313,8 +325,25 @@ driven directly, no protocol in the way — is 120 µs against the adapter's 137
 of each request is spent waiting on the store** and the remaining 12% is everything the
 protocol does. Queueing requests behind a serialized dispatcher cannot recover that wait.
 
-This is the number the pipelining work is meant to move. A flat depth-N result after it
-lands is a regression, not noise. Run it with:
+This is the number the pipelining work was meant to move, and it did. The same benchmark
+after pipelining, on the same machine, with the same 100 µs store:
+
+```
+BenchmarkConnection_ReadDepth1-8            200   188692 ns/op   21.71 MB/s
+BenchmarkConnection_ReadDepth8-8            200    31389 ns/op  130.49 MB/s
+BenchmarkConnection_ReadDepth32-8           200    32330 ns/op  126.69 MB/s
+BenchmarkConnection_ReadDepth64-8           200    35674 ns/op  114.82 MB/s
+BenchmarkConnection_ReadStoreCeiling-8      200   122058 ns/op   33.56 MB/s
+```
+
+Depth 1 to 8 now buys **6.0x** where it used to buy 1.12x, and the adapter at depth 8 is
+**3.9x faster than the store driven directly** — which is the point: eight commands are in
+flight, so eight 100 µs waits overlap into roughly one. Depth 32 and 64 are slightly *worse*
+than depth 8, because four workers per connection are already saturated and deeper queues
+only add latency. That is the shape a bounded pipeline should have, and it is why
+`max_in_flight` defaults to 4 rather than to the queue depth.
+
+A flat depth-N result would now be a regression, not noise. Run it with:
 
 ```sh
 go test -run '^$' -bench 'BenchmarkConnection_Read' -benchtime 2000x ./internal/adapter/nbd/
@@ -482,20 +511,28 @@ done
 **Do show:** the protocol works end to end against real clients and a real kernel; the adapter
 advertises nothing it cannot honour; crash/reconnect genuinely pauses and resumes I/O; the
 adapter is coherent across connections, so `CAN_MULTI_CONN` is safe to advertise; and the
-dispatch loop is serialized, with the depth plateau as direct evidence — reproduced both by an
-external sweep and by an in-process benchmark against a latency-injecting store.
+dispatch loop *was* serialized when these figures were taken, with the depth plateau as direct
+evidence — reproduced both by an external sweep and by an in-process benchmark against a
+latency-injecting store. That plateau is what motivated pipelining, which has since landed and
+moved it; the before/after benchmark is at the end of §4.
 
-**Do not show:** production readiness. There is no pipelining, no CI coverage of these rigs,
-and the live server's cache behaviour needs its own investigation before any number from it
-means anything. The performance figures above describe a prototype with a known bottleneck
-that is scheduled to be removed — not a system that has been tuned.
+**Do not show:** production readiness. There is no CI coverage of the oracle or the crash rig, and
+the live server's cache behaviour needs its own investigation before any number from it means
+anything. The performance figures above describe a prototype with a known bottleneck that has
+since been removed — not a system that has been tuned.
 
-**Two capabilities are absent by decision, not by omission,** and both are documented rather
-than left to be discovered:
+**One capability is absent by decision, not by omission,** and it is documented rather than
+left to be discovered:
 
 - `BLOCK_STATUS` and structured replies — so `qemu-img map` and `nbdinfo --map` cannot be
   used, and `qemu-img convert` copies every byte instead of only the allocated ones. The gate,
   its cost and the checklist to lift it are in [`nbd-block-status.md`](nbd-block-status.md).
-- Snapshots — an export is a live view of one volume, so there is no point-in-time copy to
-  read from. Guest-side file-level backup (`tar`, `rsync`, `restic`, `borg`) is unaffected,
-  because it never asks the block layer.
+
+**Snapshots are no longer in this list.** When the figures above were measured an export was
+only a live view of one volume, so there was no point-in-time copy to read from. A snapshot is
+now a first-class export: `<share>/snapshots/<id>/<volume>` serves the snapshot's own replayed
+metadata and content-addressed blocks, read-only, and a real kernel boots from it. See
+[`superpowers/specs/2026-10-22-nbd-volume-snapshots-design.md`](superpowers/specs/2026-10-22-nbd-volume-snapshots-design.md)
+for the design and [`../test/nbd/README.md`](../test/nbd/README.md#booting-a-snapshot-export)
+for the rig. No snapshot figure is claimed here: a full boot off a snapshot has never been
+timed, and every chunk it touches is a hydrate.
