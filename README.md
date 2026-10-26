@@ -338,7 +338,7 @@ lines against 1,880 production.)
 Every path below is where the file lives in DittoFS, unchanged.
 
 ```
-internal/adapter/nbd/           8,784 LOC — the wire layer (2,947 prod + 5,837 test)
+internal/adapter/nbd/           8,282 LOC — the wire layer (2,947 prod + 5,335 test)
   protocol.go                     wire codec: magics, header encode/decode
   handshake.go                    greeting, option haggling, export resolution
   connection.go                   Conn, Handler, BlockStore; serve hands off to pipeline
