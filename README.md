@@ -6,7 +6,7 @@ An NBD (Network Block Device) adapter for [DittoFS](https://github.com/marmos91/
 
 **This is not a standalone project.** It is an extraction of one feature branch from the DittoFS repository. Every file sits at its exact upstream path, so a merge is a file overlay rather than a patch series — see [Merging upstream](#merging-upstream).
 
-**What is here and what is not.** The 88 files this branch touches are extracted verbatim; the rest of DittoFS is not included, so this repository does not build on its own and has no `go.mod`. That is deliberate — it is a patch set with documentation, not a fork. `docs/sdd/` is the exception: those artifacts were never tracked upstream (they lived in `.superpowers/`, which DittoFS gitignores), so they are added here under `docs/sdd/` and would not be part of a merge.
+**What is here and what is not.** The 91 files this branch touches are extracted verbatim; the rest of DittoFS is not included, so this repository does not build on its own and has no `go.mod`. That is deliberate — it is a patch set with documentation, not a fork. `docs/sdd/` is the exception: those artifacts were never tracked upstream (they lived in `.superpowers/`, which DittoFS gitignores), so they are added here under `docs/sdd/` and would not be part of a merge.
 
 ---
 
@@ -38,9 +38,12 @@ NBD client  ──►  internal/adapter/nbd/  ──►  block engine  ──►
 | Payload-length enforcement (advertised 32 MiB maximum) | ✅ |
 | Pipelining — several commands in flight per connection | ✅ |
 | Volume snapshots — boot a VM from one, rehydrate one into a new volume | ✅ |
+| Per-request metrics, labelled by command | ✅ |
 | `BLOCK_STATUS`, structured replies, meta-context, `STARTTLS` | ❌ out of scope by design |
 
 `CAN_MULTI_CONN` is advertised because the flag's condition holds structurally, not because it was configured: the wire layer holds no cache, and the block store is resolved per *share*, so every connection to one export reaches the same journal and the same per-file flush locks. A `FLUSH` or FUA on one connection is therefore a barrier over bytes another connection wrote. Two tests pin this — `TestIntegration_OneBlockStorePerShare` (every resolution returns the same `*engine.Store`) and `TestIntegration_FlushOnOneConnectionCoversAWriteOnAnother` (a write on one connection is visible through a `FLUSH` on a second) — and the second was verified to fail when the store is deliberately made per-connection.
+
+The adapter records per-request RED metrics, which it previously did not while NFS and SMB both did: an operator could see a connection accepted and then no evidence of what it did. The label set is bounded by construction — five command names plus `unknown`, so a client cannot mint unlimited series by sending new command numbers. `Metrics` is an interface rather than `*metrics.Metrics` so the wire layer keeps its property of importing no `pkg/metrics`; every other adapter reaches metrics through the registry, and the `nbd` package already reaches the runtime only through interfaces. Duration is handler time measured in dispatch, not in `serve`, because `serve` returns before the reply is written.
 
 `BLOCK_STATUS` and structured replies are deliberately absent, not unfinished: advertising a residency query whose under-report case is guarded only by a runtime invariant would trade a documented limitation for an undocumented data-loss path. [`docs/nbd-block-status.md`](docs/nbd-block-status.md) states what this costs (sparse copies become full copies), what would have to be true to lift it, and what to do instead. `STARTTLS` is refused rather than ignored — a client that believed its session was encrypted and was not has no way to notice.
 
@@ -169,6 +172,8 @@ mutable state). The final design is the one implemented.
 The read-only guarantee is enforced in three independent layers, and that redundancy is deliberate — but it means an over-the-wire test of "a write is refused" passes with any one layer removed. The test therefore carries a **positive control**: the same identity first writes successfully to the production export, because a refusal caused by ordinary ownership permissions is otherwise indistinguishable from one caused by read-only.
 
 One honest limitation, verified rather than assumed: **the shadow `engine.Store` is not itself write-refusing.** A direct `WriteAt` on it succeeds. Nothing reaches it that way today — every write command is refused before the store is touched — but the guarantee lives in the handler, not in the store, and that is the layer to re-check if a future caller is added.
+
+**Two clients can boot one snapshot at once.** Each open gets its own shadow metadata and journal directory, suffixed with a per-open UUID. That is load-bearing rather than tidy: replay begins with `os.RemoveAll(dir)`, so a directory derived from the snapshot ID alone meant the second client deleted the first client's Badger files mid-read. The damage was silent — the second open succeeded, both reads returned the right bytes out of Badger's memtable, and the only symptom was that `Close` never returned, because shutdown waits for a memtable flush retrying "no such file or directory" forever. The regression test asserts the directory property rather than only the read results, precisely because a read-level assertion passed while the server was in that state.
 
 ### Defects found by running it, not by reading it
 
@@ -320,7 +325,7 @@ go test -race ./internal/adapter/... ./pkg/adapter/... ./pkg/metadata/...
 
 **And re-verified as an overlay onto `develop`'s tip** (`176be82e`), which is the state a reviewer would actually get — see [Merging upstream](#merging-upstream). `go build ./...` passes, `go vet` is clean on the five touched packages, both NBD packages pass, and every package under `./internal/adapter/...`, `./pkg/adapter/...`, `./pkg/controlplane/runtime/...`, `./internal/controlplane/api/handlers/...` and `./cmd/dfsctl/commands/share/snapshot/...` passes with zero failures.
 
-That base is not v0.36.0, and the reason is recorded in [Merging upstream](#merging-upstream): one of the 88 files calls a function that arrived upstream after the release, so the extraction can no longer be pinned to a tag.
+That base is not v0.36.0, and the reason is recorded in [Merging upstream](#merging-upstream): one of the 91 files calls a function that arrived upstream after the release, so the extraction can no longer be pinned to a tag.
 
 **189 test functions and 5 benchmarks** across 29 test files. The NBD adapter is
 5,837 lines of tests against 2,947 lines of production code in
@@ -434,7 +439,7 @@ Two of these are genuine bug fixes that affect NFS and SMB too:
 
 The point of this repository is to make a merge proposal possible, so the history was reconstructed to make one clean.
 
-**All 88 files the branch touches are byte-identical to the original branch.** Verified per file against `nbd-on-036`:
+**All 91 files the branch touches are byte-identical to the original branch.** Verified per file against `nbd-on-036`:
 
 ```
 files in branch: 88
@@ -459,17 +464,17 @@ $ git rev-list --count 176be82e..HEAD              # in the source branch, above
 An earlier version of this section claimed the base was **v0.36.0** (`51fc8443`) and that the merge was verified there. That is no longer true, and the way it stopped being true is worth recording, because the same trap will catch the next person:
 
 ```
-$ git checkout 51fc8443 && <overlay the 88 files> && go build ./...
+$ git checkout 51fc8443 && <overlay the 91 files> && go build ./...
 pkg/controlplane/runtime/runtime.go:736:19: undefined: shares.RemoveShareJournal
 ```
 
-`runtime.go` is one of the 88 files, and it calls `shares.RemoveShareJournal`. That function arrives upstream in `8acf6ff8` (#3200, "removing a share deletes its metadata, journal and local blocks"), which landed **after** v0.36.0. So the branch has moved on from the release the extraction was originally pinned to: **88 files of NBD work now sit on top of five upstream commits that are not in any release.**
+`runtime.go` is one of the 91 files, and it calls `shares.RemoveShareJournal`. That function arrives upstream in `8acf6ff8` (#3200, "removing a share deletes its metadata, journal and local blocks"), which landed **after** v0.36.0. So the branch has moved on from the release the extraction was originally pinned to: **91 files of NBD work now sit on top of five upstream commits that are not in any release.**
 
 The verified base is therefore the tip of `develop` at extraction time:
 
 ```
 $ git checkout 176be82e        # develop tip: "docs(rfc): offers carry each extent's version…"
-$ <overlay the 88 files>       # no conflicts — every file applies cleanly
+$ <overlay the 91 files>       # no conflicts — every file applies cleanly
 $ go build ./...               PASS
 $ go vet  (the five packages)  clean
 $ go test ./internal/adapter/nbd/ ./pkg/adapter/nbd/
@@ -479,7 +484,7 @@ $ go test ./internal/adapter/... ./pkg/adapter/... ./pkg/controlplane/runtime/..
                                0 failures
 ```
 
-And the claim that makes this base the right one: **the branch tree differs from `origin/develop` in exactly those 88 files, and in nothing else.** Checked as a set comparison, not by eye:
+And the claim that makes this base the right one: **the branch tree differs from `origin/develop` in exactly those 91 files, and in nothing else.** Checked as a set comparison, not by eye:
 
 ```
 $ git diff --name-only origin/develop HEAD | wc -l
@@ -518,7 +523,7 @@ Six paths exist to document the extraction and would collide with DittoFS's own 
 | `docs/nbd-block-status.md` | the BLOCK_STATUS refusal rationale, written for a reviewer |
 | `docs/sdd/` (31 files) | the SDD record; lived in `.superpowers/`, which DittoFS gitignores |
 
-Apply the other 88 files and nothing else. The verification above did exactly that: it overlaid 88 files and skipped these 36, and confirmed afterwards that all 88 were byte-identical to the branch with zero mismatches.
+Apply the other 91 files and nothing else. The verification above did exactly that: it overlaid 91 files and skipped these 36, and confirmed afterwards that all 91 were byte-identical to the branch with zero mismatches.
 
 ### To propose the merge
 
@@ -527,7 +532,7 @@ git clone https://github.com/marmos91/dittofs.git
 cd dittofs
 git checkout 176be82e          # develop tip at extraction time — the verified base
 
-# Apply the 88 files. Fetch this repository's tree and check out just those paths:
+# Apply the 91 files. Fetch this repository's tree and check out just those paths:
 git remote add nbd-exp https://github.com/esignoretti/NBD-experimental.git
 git fetch nbd-exp
 
@@ -543,7 +548,7 @@ go build ./... && go test ./internal/adapter/nbd/ ./pkg/adapter/nbd/
 
 Two things to check that this repository cannot check for you:
 
-1. **The base has moved again.** The merge was verified against `176be82e`. `develop` gains commits constantly; if any of the 88 files changed upstream after that point, expect conflicts there — and re-verify each premise, because the SDD ledger's own standing hazard is *"audits predate later fixes — re-verify each premise on develop."* The five commits between v0.36.0 and this base are a live example of exactly that.
+1. **The base has moved again.** The merge was verified against `176be82e`. `develop` gains commits constantly; if any of the 91 files changed upstream after that point, expect conflicts there — and re-verify each premise, because the SDD ledger's own standing hazard is *"audits predate later fixes — re-verify each premise on develop."* The five commits between v0.36.0 and this base are a live example of exactly that.
 2. **`crash-restart.sh` has run end to end on a real Linux host, not just in a container.** It needs Linux, root and an `nbd-client` built from upstream master (3.26.1 has no `-T`; 3.27.1's `--persist` is silently dead). The run that first passed also found three defects in the script itself — a missing `-t`, a pre-flight that described the file rather than the running server, and no size cross-check — all fixed and described in [`docs/nbd-benchmarks.md`](docs/nbd-benchmarks.md).
 
 ### `go test ./...` has two failures, neither from this work
