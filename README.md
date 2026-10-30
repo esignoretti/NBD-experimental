@@ -2,7 +2,7 @@
 
 An NBD (Network Block Device) adapter for [DittoFS](https://github.com/marmos91/dittofs), extracted for review and merge proposal.
 
-**Status:** a working prototype, now pipelined and snapshot-capable. The protocol is implemented end to end, it has booted a real kernel from a real export, it serves several commands per connection concurrently — depth 16 measures 1.45× what the serialized dispatcher reached — and a VM can boot from a **snapshot** of its own volume while the production volume keeps running. It is still not production-ready: no CI job runs the kernel-boot rig, buffer pooling is unbuilt, and a handful of minors are recorded. Nine defects found by review and by running the rigs are fixed here. Never merged upstream. See [Status](#status) and [`docs/nbd-benchmarks.md`](docs/nbd-benchmarks.md).
+**Status:** a working prototype, now pipelined and snapshot-capable. The protocol is implemented end to end, it has booted a real kernel from a real export, it serves several commands per connection concurrently — depth 16 measures 1.45× what the serialized dispatcher reached — and a VM can boot from a **snapshot** of its own volume while the production volume keeps running. It is still not production-ready: no CI job runs the kernel-boot rig, buffer pooling is unbuilt, and a handful of minors are recorded. Ten defects found by review and by running the rigs are fixed here. Never merged upstream. See [Status](#status) and [`docs/nbd-benchmarks.md`](docs/nbd-benchmarks.md).
 
 **This is not a standalone project.** It is an extraction of one feature branch from the DittoFS repository. Every file sits at its exact upstream path, so a merge is a file overlay rather than a patch series — see [Merging upstream](#merging-upstream).
 
@@ -182,6 +182,16 @@ One honest limitation, verified rather than assumed: **the shadow `engine.Store`
 `deferredCommitWrite` read after the lock was released. That was safe only while
 every protocol adapter dispatched one command at a time per file — exactly what NBD
 no longer does. It now returns a copy taken under the lock.
+
+**Two clients opening one snapshot destroyed each other.** The shadow metadata
+and journal directories were derived from the snapshot ID alone, and replay begins
+with `os.RemoveAll(dir)`, so the second open deleted the first open's Badger
+directory mid-read. The damage was silent: the second open succeeded, both reads
+returned the right bytes out of Badger's memtable, and the only symptom was that
+`Close` never returned — shutdown waits for a memtable flush retrying "no such file
+or directory" forever. Each open now gets its own directory pair. The regression
+test asserts the directory property rather than only the read results, precisely
+because a read-level assertion passed while the server was in that state.
 
 **`SetPipelining` was never called.** The handler's fields were read by `serve` and
 written by nobody: the adapter built the handler without them, so every configured
